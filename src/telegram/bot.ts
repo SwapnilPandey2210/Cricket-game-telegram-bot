@@ -1,12 +1,13 @@
 import { Telegraf, Markup, Scenes, session } from 'telegraf';
 type MyWizardContext = Scenes.WizardContext;
 import { PrismaClient } from '@prisma/client';
-import { ensureUser, openPackForUser, listUserCards, claimDaily, getLeaderboard, pickRarity } from '../services/game.js';
-import { browseMarket, listForSale, buyFromMarket, cancelListing } from '../services/market.js';
-import { createTrade, acceptTrade, rejectTrade, myTrades } from '../services/trade.js';
-import axios from 'axios';
-import fs from 'fs';
-import path from 'path';
+import { ensureUser, openPackForUser, listUserCards, claimDaily, getLeaderboard } from '../services/game.js';
+
+function isAdmin(user: {
+  firstName?: string | null;
+}) {
+  return user.firstName === 'SP';
+}
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -15,13 +16,7 @@ if (!token) {
 
 const prisma = new PrismaClient();
 const bot = new Telegraf(token);
-export { bot, prisma };
-
-function isAdmin(user: {
-  firstName?: string | null;
-}) {
-  return user.firstName === 'SP';
-}
+export { bot, prisma }
 
 // Command handlers that work in both private and group chats
 bot.command('openpack', async (ctx) => {
@@ -153,13 +148,28 @@ bot.command('removepmarket', async (ctx) => {
 bot.start(async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const name = user.username || user.firstName || 'collector';
-  await ctx.reply(`Welcome, ${name}!
-Collect, trade, and showcase cricket cards.`, Markup.keyboard([
-    ['🃏 Open Pack', '📇 My Cards'],
-    ['🛒 Market', '🔁 Trade'],
-    ['🏆 Leaderboard', '🎁 Daily'],
-    ['ℹ️ Help']
-  ]).resize());
+  // Check for deep link start parameter (for card details)
+  const startParam = ctx.startPayload;
+  if (startParam && /^card\d+$/.test(startParam)) {
+    const cardId = Number(startParam.replace('card', ''));
+    if (cardId) {
+      const card = await prisma.card.findUnique({ where: { id: cardId } });
+      if (card) {
+        await sendCardDetails(ctx, card);
+        return;
+      }
+    }
+  }
+  await ctx.reply(
+    `Welcome, ${name}!
+Collect, trade, and showcase cricket cards.`,
+    Markup.keyboard([
+      ['🃏 Open Pack', '📇 My Cards'],
+      ['🛒 Market', '🔁 Trade'],
+      ['🏆 Leaderboard', '🎁 Daily'],
+      ['ℹ️ Help']
+    ]).resize()
+  );
 });
 
 function marketKeyboard() {
@@ -378,6 +388,30 @@ bot.command('buypmarket', async (ctx) => {
   }
 });
 
+// Command to change or add image for a card: /changeimage card_id image_link
+bot.command('changeimage', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  const imageUrl = parts[2];
+  if (!cardId || !imageUrl) {
+    return ctx.reply('Usage: /changeimage <cardId> <imageUrl>');
+  }
+  try {
+    const card = await prisma.card.findUnique({ where: { id: cardId } });
+    if (!card) return ctx.reply('Card not found.');
+    const prevImage = (card as any).imageUrl;
+    await prisma.card.update({ where: { id: cardId }, data: { imageUrl } as any });
+    if (prevImage) {
+      await ctx.reply('Image updated for card: ' + card.name);
+    } else {
+      await ctx.reply('Image added for card: ' + card.name);
+    }
+  } catch (e: any) {
+    await ctx.reply('Failed to update image: ' + (e.message || e));
+  }
+});
+
 // --- Group card drop feature ---
 
 // In-memory maps to track group message counts and active card drops
@@ -475,16 +509,48 @@ bot.on("message", async (ctx, next) => {
     if (!activeCardDrops.has(chatId) && count % 10 === 0) {
       const card = await getRandomCard(prisma);
       if (card) {
-        activeCardDrops.set(chatId, { ...card, collected: false });
+  // Ensure card.imageUrl is present for drop (cast as any for type safety)
+  const imageUrl = (card as any).imageUrl || null;
+  activeCardDrops.set(chatId, { ...card, imageUrl, collected: false });
 
-        // Send a card drop message with an inline 'Check name' button
-        await ctx.reply("A card has dropped! Press 'Check name' to view the card details.", {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "Check name", callback_data: "check_card" }]
-            ]
+        // 1. Send the card photo if available, else fallback to text
+        if (imageUrl) {
+          try {
+            await ctx.telegram.sendPhoto(
+              chatId,
+              imageUrl,
+              {
+                caption: `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`
+              }
+            );
+          } catch (e) {
+            await ctx.telegram.sendMessage(
+              chatId,
+              `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`
+            );
           }
-        });
+        } else {
+          await ctx.telegram.sendMessage(
+            chatId,
+            `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`
+          );
+        }
+
+        // 2. Send the check details button (link to bot chat with /start=cardID)
+        const botUsername = ctx.botInfo?.username || '';
+        const startParam = encodeURIComponent(`card${card.id}`);
+        const url = `https://t.me/${botUsername}?start=${startParam}`;
+        await ctx.telegram.sendMessage(
+          chatId,
+          'Check details:',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: 'Check details', url }]
+              ]
+            }
+          }
+        );
       }
     }
   }
