@@ -1,4 +1,7 @@
 import { Telegraf, Markup, Scenes, session } from 'telegraf';
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
 type MyWizardContext = Scenes.WizardContext;
 import { PrismaClient } from '@prisma/client';
 import { ensureUser, openPackForUser, listUserCards, claimDaily, getLeaderboard } from '../services/game.js';
@@ -20,7 +23,7 @@ export { bot, prisma }
 
 // Command handlers that work in both private and group chats
 bot.command('openpack', async (ctx) => {
-  await ctx.reply('Could not identify user');
+  await ctx.reply('Could not identify user', { ...getReplyParams(ctx) });
   return;
 });
 
@@ -28,52 +31,81 @@ bot.command('openpack', async (ctx) => {
 const addCardWizard = new Scenes.WizardScene<MyWizardContext>(
   'add-card-wizard',
   async (ctx) => {
-  (ctx.wizard.state as any).card = {}; // Initialize the card object
-    await ctx.reply('Enter card name:');
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
+    (ctx.wizard.state as any).card = {}; // Initialize the card object
+    await ctx.reply('Enter card name:', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.name = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
-    await ctx.reply('Enter card slug (unique identifier):');
+    await ctx.reply('Enter card slug (unique identifier):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.slug = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
-    await ctx.reply('Enter rarity (COMMON, RARE, EPIC, LEGENDARY):');
+    await ctx.reply('Enter rarity (COMMON, RARE, EPIC, LEGENDARY):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.rarity = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
-    await ctx.reply('Enter country/team:');
+    await ctx.reply('Enter country/team:', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.country = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
-    await ctx.reply('Enter role (e.g. Batsman, Bowler, All-rounder):');
+    await ctx.reply('Enter role (e.g. Batsman, Bowler, All-rounder):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.role = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
-    await ctx.reply('Enter rating (number):');
+    await ctx.reply('Enter rating (number):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.rating = Number(ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '0');
-    await ctx.reply('Enter bio (or type "skip"):');
+    await ctx.reply('Enter bio (or type "skip"):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.bio = ctx.message && 'text' in ctx.message && (ctx.message as any).text === 'skip' ? null : ctx.message && 'text' in ctx.message ? (ctx.message as any).text : null;
-    await ctx.reply('Enter image URL (or type "skip"):');
+    await ctx.reply('Enter image URL (or type "skip"):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
     return ctx.wizard.next();
   },
   async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card.imageUrl = ctx.message && 'text' in ctx.message && (ctx.message as any).text === 'skip' ? null : ctx.message && 'text' in ctx.message ? (ctx.message as any).text : null;
     try {
       const card = await prisma.card.create({ data: (ctx.wizard.state as any).card });
-      await ctx.reply(`Card added: ${card.name} (${card.rarity})`);
+      await ctx.reply(`Card added: ${card.name} (${card.rarity})`, {
+        ...(reply_parameters ? { reply_parameters } : {})
+      });
     } catch (e: any) {
-      await ctx.reply(`Error adding card: ${e.message}`);
+      await ctx.reply(`Error adding card: ${e.message}`, {
+        ...(reply_parameters ? { reply_parameters } : {})
+      });
     }
     return ctx.scene.leave();
   }
@@ -91,29 +123,29 @@ bot.command('addcard', async (ctx) => {
 bot.command('deletecard', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   if (!isAdmin(user)) {
-    return ctx.reply('You are not authorized to use this command.');
+    return ctx.reply('You are not authorized to use this command.', { ...getReplyParams(ctx) });
   }
   const parts = (ctx.message.text || '').split(/\s+/);
   const cardId = Number(parts[1]);
-  if (!cardId) return ctx.reply('Usage: /deletecard <cardId>');
+  if (!cardId) return ctx.reply('Usage: /deletecard <cardId>', { ...getReplyParams(ctx) });
   try {
     const deleted = await prisma.card.delete({ where: { id: cardId } });
-    await ctx.reply(`Card deleted: ${deleted.name} (${deleted.rarity})`);
+    await ctx.reply(`Card deleted: ${deleted.name} (${deleted.rarity})`, { ...getReplyParams(ctx) });
   } catch (e: any) {
-    await ctx.reply(`Error deleting card: ${e.message}`);
+    await ctx.reply(`Error deleting card: ${e.message}`, { ...getReplyParams(ctx) });
   }
 });
 // Command to check card details: /check card_id
 bot.command('check', async (ctx) => {
   const parts = (ctx.message.text || '').split(/\s+/);
   const cardId = Number(parts[1]);
-  if (!cardId) return ctx.reply('Usage: /check <cardId>');
+  if (!cardId) return ctx.reply('Usage: /check <cardId>', { ...getReplyParams(ctx) });
   try {
     const card = await prisma.card.findUnique({ where: { id: cardId } });
-    if (!card) return ctx.reply('Card not found.');
+    if (!card) return ctx.reply('Card not found.', { ...getReplyParams(ctx) });
     await sendCardDetails(ctx, card);
   } catch (e: any) {
-    await ctx.reply('Error fetching card details.');
+    await ctx.reply('Error fetching card details.', { ...getReplyParams(ctx) });
   }
 });
 
@@ -122,11 +154,11 @@ bot.command('removepmarket', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const parts = (ctx.message.text || '').split(/\s+/);
   const cardId = Number(parts[1]);
-  if (!cardId) return ctx.reply('Usage: /removepmarket <cardId>');
+  if (!cardId) return ctx.reply('Usage: /removepmarket <cardId>', { ...getReplyParams(ctx) });
   try {
     // Find all active listings for this card by the user
     const listings = await prisma.listing.findMany({ where: { sellerId: user.id, cardId, active: true } });
-    if (listings.length === 0) return ctx.reply('No active listings for this card found.');
+    if (listings.length === 0) return ctx.reply('No active listings for this card found.', { ...getReplyParams(ctx) });
     let removed = 0;
     for (const listing of listings) {
       // Mark listing inactive and return quantity to user
@@ -139,9 +171,9 @@ bot.command('removepmarket', async (ctx) => {
       }
       removed++;
     }
-    await ctx.reply(`Removed ${removed} active listing(s) for card ${cardId} from market.`);
+    await ctx.reply(`Removed ${removed} active listing(s) for card ${cardId} from market.`, { ...getReplyParams(ctx) });
   } catch (e: any) {
-    await ctx.reply(`Remove from market failed: ${e.message}`);
+    await ctx.reply(`Remove from market failed: ${e.message}`, { ...getReplyParams(ctx) });
   }
 });
 
@@ -161,14 +193,16 @@ bot.start(async (ctx) => {
     }
   }
   await ctx.reply(
-    `Welcome, ${name}!
-Collect, trade, and showcase cricket cards.`,
-    Markup.keyboard([
-      ['🃏 Open Pack', '📇 My Cards'],
-      ['🛒 Market', '🔁 Trade'],
-      ['🏆 Leaderboard', '🎁 Daily'],
-      ['ℹ️ Help']
-    ]).resize()
+    `Welcome, ${name}!\nCollect, trade, and showcase cricket cards.`,
+    {
+      reply_markup: Markup.keyboard([
+        ['🃏 Open Pack', '📇 My Cards'],
+        ['🛒 Market', '🔁 Trade'],
+        ['🏆 Leaderboard', '🎁 Daily'],
+        ['ℹ️ Help']
+      ]).resize(),
+      ...getReplyParams(ctx)
+    }
   );
 });
 
@@ -188,32 +222,32 @@ bot.hears('🃏 Open Pack', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   try {
     const results = await openPackForUser(prisma, user.id);
-    await ctx.reply('You opened a pack and pulled:\n' + results.map(r => '- ' + r.card.name + ' (' + r.card.rarity + ')').join('\n'));
+    await ctx.reply('You opened a pack and pulled:\n' + results.map(r => '- ' + r.card.name + ' (' + r.card.rarity + ')').join('\n'), { ...getReplyParams(ctx) });
   } catch (e: any) {
     const msg = e && e.message ? e.message : 'Failed to open pack.';
-    await ctx.reply(msg);
+    await ctx.reply(msg, { ...getReplyParams(ctx) });
   }
 });
 
 bot.hears('📇 My Cards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const cards = await listUserCards(prisma, user.id);
-  if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!');
-  await ctx.reply(cards.map(c => `${c.card.name} x${c.quantity} [${c.card.rarity}] (id:${c.cardId})`).join('\n'));
+  if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!', { ...getReplyParams(ctx) });
+  await ctx.reply(cards.map(c => `${c.card.name} x${c.quantity} [${c.card.rarity}] (id:${c.cardId})`).join('\n'), { ...getReplyParams(ctx) });
 });
 
 bot.hears('🎁 Daily', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const res = await claimDaily(prisma, user.id);
-  if (!res.ok) return ctx.reply(res.message);
-  await ctx.reply(`Claimed ${res.coins} coins! Balance: ${res.balance}`);
+  if (!res.ok) return ctx.reply(res.message, { ...getReplyParams(ctx) });
+  await ctx.reply(`Claimed ${res.coins} coins! Balance: ${res.balance}`, { ...getReplyParams(ctx) });
 });
 
 bot.hears('🏆 Leaderboard', async (ctx) => {
   const top = await getLeaderboard(prisma);
-  if (top.length === 0) return ctx.reply('No players yet. Be the first!');
+  if (top.length === 0) return ctx.reply('No players yet. Be the first!', { ...getReplyParams(ctx) });
   const msg = top.map((u, i) => `${i + 1}. ${u.username ?? 'anon'} — ${u.coins} coins`).join('\n');
-  await ctx.reply(msg);
+  await ctx.reply(msg, { ...getReplyParams(ctx) });
 });
 
 bot.hears('🛒 Market', async (ctx) => {
@@ -336,18 +370,18 @@ bot.command('pack', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   try {
     const results = await openPackForUser(prisma, user.id);
-    await ctx.reply('Pack result:\n' + results.map(r => '- ' + r.card.name + ' (' + r.card.rarity + ')').join('\n'));
+    await ctx.reply('Pack result:\n' + results.map(r => '- ' + r.card.name + ' (' + r.card.rarity + ')').join('\n'), { ...getReplyParams(ctx) });
   } catch (e: any) {
     const msg = e && e.message ? e.message : 'Failed to open pack.';
-    await ctx.reply(msg);
+    await ctx.reply(msg, { ...getReplyParams(ctx) });
   }
 });
 
 bot.command('cards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const cards = await listUserCards(prisma, user.id);
-  if (cards.length === 0) return ctx.reply('You have no cards yet. Try /pack');
-  await ctx.reply(cards.map(c => `${c.card.name} x${c.quantity} [${c.card.rarity}] (id:${c.cardId})`).join('\n'));
+  if (cards.length === 0) return ctx.reply('You have no cards yet. Try /pack', { ...getReplyParams(ctx) });
+  await ctx.reply(cards.map(c => `${c.card.name} x${c.quantity} [${c.card.rarity}] (id:${c.cardId})`).join('\n'), { ...getReplyParams(ctx) });
 });
 
 bot.command('profile', async (ctx) => {
@@ -513,44 +547,42 @@ bot.on("message", async (ctx, next) => {
   const imageUrl = (card as any).imageUrl || null;
   activeCardDrops.set(chatId, { ...card, imageUrl, collected: false });
 
-        // 1. Send the card photo if available, else fallback to text
+        // Send a single message (photo or text) with the 'Check details' button
+        const botUsername = ctx.botInfo?.username || '';
+        const startParam = encodeURIComponent(`card${card.id}`);
+        const url = `https://t.me/${botUsername}?start=${startParam}`;
+        const caption = `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`;
+        const reply_markup = {
+          inline_keyboard: [
+            [{ text: 'Check details', url }]
+          ]
+        };
+        const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
         if (imageUrl) {
           try {
             await ctx.telegram.sendPhoto(
               chatId,
               imageUrl,
               {
-                caption: `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`
+                caption,
+                reply_markup,
+                ...(reply_parameters ? { reply_parameters } : {})
               }
             );
           } catch (e) {
             await ctx.telegram.sendMessage(
               chatId,
-              `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`
+              caption,
+              { reply_markup, ...(reply_parameters ? { reply_parameters } : {}) }
             );
           }
         } else {
           await ctx.telegram.sendMessage(
             chatId,
-            `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`
+            caption,
+            { reply_markup, ...(reply_parameters ? { reply_parameters } : {}) }
           );
         }
-
-        // 2. Send the check details button (link to bot chat with /start=cardID)
-        const botUsername = ctx.botInfo?.username || '';
-        const startParam = encodeURIComponent(`card${card.id}`);
-        const url = `https://t.me/${botUsername}?start=${startParam}`;
-        await ctx.telegram.sendMessage(
-          chatId,
-          'Check details:',
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: 'Check details', url }]
-              ]
-            }
-          }
-        );
       }
     }
   }
@@ -596,7 +628,6 @@ function isValidImageUrl(url: string): boolean {
 
 // Helper function to send card details with image
 async function sendCardDetails(ctx: any, card: any, chatId?: number) {
-// (stray lines removed)
   // Always use ctx.telegram.sendPhoto for sending images, to avoid argument confusion
 
   // Debug log to verify arguments
@@ -613,7 +644,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
     await ctx.telegram.sendMessage(
       chatId || ctx.chat.id,
       cardDetails,
-      { parse_mode: 'HTML' }
+      { parse_mode: 'HTML', ...getReplyParams(ctx) }
     );
     return true;
   }
@@ -626,7 +657,8 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
       card.imageUrl,
       {
         caption: cardDetails,
-        parse_mode: 'HTML'
+        parse_mode: 'HTML',
+        ...getReplyParams(ctx)
       }
     );
     return true;
@@ -644,7 +676,8 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
           { source: buffer, filename: 'card.jpg' },
           {
             caption: cardDetails,
-            parse_mode: 'HTML'
+            parse_mode: 'HTML',
+            ...getReplyParams(ctx)
           }
         );
         return true;
@@ -659,7 +692,8 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
             { source: fs.createReadStream(tempPath) },
             {
               caption: cardDetails,
-              parse_mode: 'HTML'
+              parse_mode: 'HTML',
+              ...getReplyParams(ctx)
             }
           );
           fs.unlinkSync(tempPath);
@@ -678,7 +712,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
   await ctx.telegram.sendMessage(
     chatId || ctx.chat.id,
     cardDetails,
-    { parse_mode: 'HTML' }
+    { parse_mode: 'HTML', ...getReplyParams(ctx) }
   );
   return true;
 }
@@ -752,6 +786,11 @@ bot.on("text", async (ctx, next) => {
   }
   return next();
 });
+
+// Helper to always get reply_parameters for a ctx
+function getReplyParams(ctx) {
+  return ctx.message?.message_id ? { reply_parameters: { message_id: ctx.message.message_id } } : {};
+}
 
 // Insert Group Command Admin Middleware
 bot.use(async (ctx, next) => {
