@@ -1,0 +1,101 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             Int       @id @default(autoincrement())
+  telegramId     String    @unique
+  username       String?
+  firstName      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  coins          Int       @default(100)
+  lastDailyAt    DateTime?
+  lastPackAt    DateTime?
+  ownedCards     Ownership[]
+  tradesSent     Trade[]   @relation("trades_sent")
+  tradesReceived Trade[]   @relation("trades_received")
+  listings       Listing[]
+  userAchievements UserAchievement[]
+}
+
+model Card {
+  id          Int         @id @default(autoincrement())
+  slug        String      @unique
+  name        String
+  rarity      String      @default("COMMON")
+  country     String
+  role        String
+  rating      Int
+  bio         String?
+  imageUrl    String?
+  createdAt   DateTime    @default(now())
+  ownerships  Ownership[]
+  listings    Listing[]
+  offeredTrades   Trade[] @relation("offered")
+  requestedTrades Trade[] @relation("requested")
+}
+
+model Ownership {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
+  card      Card     @relation(fields: [cardId], references: [id])
+  cardId    Int
+  quantity  Int      @default(1)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, cardId])
+}
+
+model Listing {
+  id        Int      @id @default(autoincrement())
+  seller    User     @relation(fields: [sellerId], references: [id])
+  sellerId  Int
+  card      Card     @relation(fields: [cardId], references: [id])
+  cardId    Int
+  price     Int
+  quantity  Int      @default(1)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model Trade {
+  id             Int      @id @default(autoincrement())
+  fromUser       User     @relation("trades_sent", fields: [fromUserId], references: [id])
+  fromUserId     Int
+  toUser         User     @relation("trades_received", fields: [toUserId], references: [id])
+  toUserId       Int
+  offeredCard    Card     @relation("offered", fields: [offeredCardId], references: [id])
+  offeredCardId  Int
+  requestedCard  Card     @relation("requested", fields: [requestedCardId], references: [id])
+  requestedCardId Int
+  status         String   @default("PENDING")
+  createdAt      DateTime @default(now())
+}
+
+model Achievement {
+  id        Int      @id @default(autoincrement())
+  code      String   @unique
+  title     String
+  description String
+  createdAt DateTime @default(now())
+  userAchievements UserAchievement[]
+}
+
+model UserAchievement {
+  id             Int      @id @default(autoincrement())
+  user           User     @relation(fields: [userId], references: [id])
+  userId         Int
+  achievement    Achievement @relation(fields: [achievementId], references: [id])
+  achievementId  Int
+  createdAt      DateTime @default(now())
+
+  @@unique([userId, achievementId])
+}
+
