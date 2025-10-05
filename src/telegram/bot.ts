@@ -21,15 +21,28 @@ const prisma = new PrismaClient();
 const bot = new Telegraf(token);
 export { bot, prisma }
 
+// Do not need separate action handlers as we'll handle them in the wizard
+
 // Command handlers that work in both private and group chats
 bot.command('openpack', async (ctx) => {
-  await ctx.reply('Could not identify user', { ...getReplyParams(ctx) });
-  return;
+  try {
+    const user = await ensureUser(prisma, ctx.from);
+    const results = await openPackForUser(prisma, user.id);
+    // Format each card with the new template
+    for (const result of results) {
+      const message = `✪ You Collected A ${result.card.rarity} !!\n\n${result.card.name}\n➥ ${result.card.country}\n\nTake A Look At Your Collection Using /cards`;
+      await ctx.reply(message, { ...getReplyParams(ctx) });
+    }
+  } catch (e: any) {
+    const msg = e && e.message ? e.message : 'Failed to open pack.';
+    await ctx.reply(msg, { ...getReplyParams(ctx) });
+  }
 });
 
 // Helper function to send card details with image
 const addCardWizard = new Scenes.WizardScene<MyWizardContext>(
   'add-card-wizard',
+  // Step 1: Enter card name
   async (ctx) => {
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card = {}; // Initialize the card object
@@ -38,29 +51,89 @@ const addCardWizard = new Scenes.WizardScene<MyWizardContext>(
     });
     return ctx.wizard.next();
   },
+  // Step 2: Enter card slug
   async (ctx) => {
+    if (!ctx.message || !('text' in ctx.message)) return;
+    
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    (ctx.wizard.state as any).card.name = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
+    (ctx.wizard.state as any).card.name = ctx.message.text;
+    
     await ctx.reply('Enter card slug (unique identifier):', {
       ...(reply_parameters ? { reply_parameters } : {})
     });
     return ctx.wizard.next();
   },
+  // Step 3: Show rarity options
   async (ctx) => {
+    if (!ctx.message || !('text' in ctx.message)) return;
+    
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    (ctx.wizard.state as any).card.slug = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
-    await ctx.reply('Enter rarity (COMMON, RARE, EPIC, LEGENDARY):', {
+    (ctx.wizard.state as any).card.slug = ctx.message.text;
+    (ctx.wizard.state as any).userId = ctx.from?.id; // Store user ID
+    
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '🥉 Common', callback_data: 'rarity_COMMON' },
+          { text: '🥈 Medium', callback_data: 'rarity_MEDIUM' }
+        ],
+        [
+          { text: '🥇 Rare', callback_data: 'rarity_RARE' },
+          { text: '🟡 Legendary', callback_data: 'rarity_LEGENDARY' }
+        ],
+        [
+          { text: '💮 Exclusive', callback_data: 'rarity_EXCLUSIVE' },
+          { text: '🔮 Limited Edition', callback_data: 'rarity_LIMITED' }
+        ],
+        [
+          { text: '💠 Cosmic', callback_data: 'rarity_COSMIC' },
+          { text: '♠️ Prime', callback_data: 'rarity_PRIME' }
+        ],
+        [
+          { text: '🧿 Premium', callback_data: 'rarity_PREMIUM' }
+        ]
+      ]
+    };
+    
+    await ctx.reply('Select card rarity:', {
+      reply_markup: keyboard,
       ...(reply_parameters ? { reply_parameters } : {})
     });
     return ctx.wizard.next();
   },
+  // Step 4: Handle rarity selection and ask for country
   async (ctx) => {
-    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    (ctx.wizard.state as any).card.rarity = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
-    await ctx.reply('Enter country/team:', {
-      ...(reply_parameters ? { reply_parameters } : {})
-    });
-    return ctx.wizard.next();
+    // Handle both message and callback_query updates
+    if (ctx.callbackQuery) {
+      const callbackQuery = ctx.callbackQuery as any;
+      if (!callbackQuery.data?.startsWith('rarity_')) {
+        await ctx.answerCbQuery('Invalid selection');
+        return;
+      }
+
+      // Check if this is the user who started the wizard
+      if (!ctx.from || ctx.from.id !== (ctx.wizard.state as any).userId) {
+        await ctx.answerCbQuery('Only the user who started the command can select options');
+        return;
+      }
+
+      const rarity = callbackQuery.data.replace('rarity_', '');
+      (ctx.wizard.state as any).card.rarity = rarity;
+
+      // Remove the inline keyboard and show selection
+      await ctx.editMessageText(`Selected rarity: ${rarity}`);
+      await ctx.answerCbQuery();
+
+      // Move to country input
+      await ctx.reply('Enter country/team:', { ...getReplyParams(ctx) });
+      return ctx.wizard.next();
+    }
+
+    // If we get a message instead of a callback, remind to use buttons
+    if (ctx.message) {
+      await ctx.reply('Please use the buttons above to select a rarity');
+      return;
+    }
   },
   async (ctx) => {
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
@@ -777,7 +850,8 @@ bot.on("text", async (ctx, next) => {
 
         activeCard.collected = true;
         activeCardDrops.set(chatId, activeCard);
-        await ctx.reply(`${ctx.from.first_name} collected the card: ${activeCard.name} (${getRarityWithEmoji(activeCard.rarity)})!`);
+        const message = `✪ You Collected A ${activeCard.rarity} !!\n\n${activeCard.name}\n➥ ${activeCard.country}\n\nTake A Look At Your Collection Using /cards`;
+        await ctx.reply(message, { ...getReplyParams(ctx) });
       } catch (error) {
         console.error('Error adding card to collection:', error);
         await ctx.reply('Error adding card to your collection.');
