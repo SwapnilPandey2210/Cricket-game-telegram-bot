@@ -713,12 +713,32 @@ bot.hears('🏆 Leaderboard', async (ctx) => {
   await ctx.reply(msg, { ...getReplyParams(ctx) });
 });
 
-bot.hears('🛒 Market', async (ctx) => {
+bot.command('market', async (ctx) => {
   const listings = await browseMarket(prisma);
-  if (listings.length === 0) return ctx.reply('No active listings.');
-  let msg = 'Market Listings:\n';
-  msg += listings.map(l => `${l.card.name} (id:${l.cardId}) — ${l.price} coins`).join('\n');
-  await ctx.reply(msg);
+  if (listings.length === 0) return ctx.reply('No active listings in the market.', marketKeyboard());
+
+  let msg = '🏪 *Market Listings*\n\n';
+  for (const l of listings) {
+    msg += `*${l.card.name}* [${l.card.rarity}]\n`;
+    msg += `├ ID: \`${l.cardId}\`\n`;
+    msg += `├ Price: ${l.price} 💰\n`;
+    msg += `├ Quantity: ${l.quantity}x\n`;
+    msg += `└ Seller: @${l.seller.username ?? 'anon'}\n\n`;
+  }
+  msg += '\nMarket Commands:\n';
+  msg += '`/addpmarket card_id price` - List a card for sale\n';
+  msg += '`/buypmarket card_id quantity` - Buy a card\n';
+  msg += '`/removepmarket card_id` - Remove your listing';
+
+  await ctx.reply(msg, { 
+    parse_mode: 'Markdown',
+    ...marketKeyboard()
+  });
+});
+
+bot.hears('🛒 Market', async (ctx) => {
+  // Redirect to /market command for consistency
+  await ctx.reply('Use /market to view all listings', marketKeyboard());
 });
 
 bot.action(/^market_refresh$/, async (ctx) => {
@@ -730,6 +750,8 @@ bot.action(/^market_refresh$/, async (ctx) => {
   }
 });
 
+
+
 bot.action(/^buy_(\d+)_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const [, listingStr, qtyStr] = ctx.match as unknown as string[];
@@ -738,9 +760,9 @@ bot.action(/^buy_(\d+)_(\d+)$/, async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   try {
     const res = await buyFromMarket(prisma, user.id, listingId, qty);
-    await ctx.reply(`Purchased x${qty}. Spent ${res.spent} coins.`);
+    await ctx.reply(`✅ Purchased x${qty}. Spent ${res.spent} coins.`, marketKeyboard());
   } catch (e: any) {
-    await ctx.reply(`Buy failed: ${e.message}`);
+    await ctx.reply(`❌ Purchase failed: ${e.message}`, marketKeyboard());
   }
 });
 
