@@ -5,12 +5,14 @@ import path from 'path';
 type MyWizardContext = Scenes.WizardContext;
 import { PrismaClient } from '@prisma/client';
 import { ensureUser, openPackForUser, listUserCards, claimDaily, getLeaderboard } from '../services/game.js';
+import { createTrade, acceptTrade, rejectTrade, myTrades } from '../services/trade.js';
+import { browseMarket, listForSale, buyFromMarket, cancelListing } from '../services/market.js';
 
 async function isAdmin(user: { id: number }): Promise<boolean> {
   const dbUser = await prisma.user.findUnique({
     where: { id: user.id }
   });
-  return dbUser?.isAdmin || false;
+  return (dbUser as any)?.isAdmin || false;
 }
 
 const token = process.env.BOT_TOKEN;
@@ -43,7 +45,7 @@ bot.command('openpack', async (ctx) => {
 // Helper function to send card details with image
 const addCardWizard = new Scenes.WizardScene<MyWizardContext>(
   'add-card-wizard',
-  // Step 1: Enter card name
+  // Step 1: Enter card name (slug will be auto-generated)
   async (ctx) => {
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     (ctx.wizard.state as any).card = {}; // Initialize the card object
@@ -52,24 +54,13 @@ const addCardWizard = new Scenes.WizardScene<MyWizardContext>(
     });
     return ctx.wizard.next();
   },
-  // Step 2: Enter card slug
+  // Step 2: Show rarity options
   async (ctx) => {
     if (!ctx.message || !('text' in ctx.message)) return;
     
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    (ctx.wizard.state as any).card.name = ctx.message.text;
-    
-    await ctx.reply('Enter card slug (unique identifier):', {
-      ...(reply_parameters ? { reply_parameters } : {})
-    });
-    return ctx.wizard.next();
-  },
-  // Step 3: Show rarity options
-  async (ctx) => {
-    if (!ctx.message || !('text' in ctx.message)) return;
-    
-    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    (ctx.wizard.state as any).card.slug = ctx.message.text;
+    const name = ctx.message.text;
+    (ctx.wizard.state as any).card.name = name;
     (ctx.wizard.state as any).userId = ctx.from?.id; // Store user ID
     
     const keyboard = {
@@ -271,7 +262,7 @@ bot.start(async (ctx) => {
         ['🛒 Market', '🔁 Trade'],
         ['🏆 Leaderboard', '🎁 Daily'],
         ['ℹ️ Help']
-      ]).resize(),
+      ]).resize() as any,
       ...getReplyParams(ctx)
     }
   );
@@ -304,8 +295,121 @@ bot.hears('📇 My Cards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const cards = await listUserCards(prisma, user.id);
   if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!', { ...getReplyParams(ctx) });
-  const cardsList = cards.map(c => `<b>Card ID:</b> ${c.cardId}\n<b>Name:</b> ${c.card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(c.card.rarity)}\n<b>Country:</b> ${c.card.country}\n<b>Role:</b> ${c.card.role}\n<b>Quantity:</b> x${c.quantity}`).join('\n\n');
-  await ctx.replyWithHTML(cardsList, { ...getReplyParams(ctx) });
+  
+  // Get or initialize user's current page
+  const userId = ctx.from.id;
+  if (!userCardPages.has(userId)) {
+    userCardPages.set(userId, 0);
+  }
+  
+  const PAGE_SIZE = 5;
+  const totalPages = Math.ceil(cards.length / PAGE_SIZE);
+  const currentPage = userCardPages.get(userId) || 0;
+  const start = currentPage * PAGE_SIZE;
+  const end = start + PAGE_SIZE;
+  const pageCards = cards.slice(start, end);
+  
+  const cardsList = pageCards.map(c => 
+    `${getRarityWithEmoji(c.card.rarity)} ${c.card.name} (ID: ${c.cardId}) x${c.quantity}`
+  ).join('\n');
+  
+  const message = `📇 Your Cards (Page ${currentPage + 1}/${totalPages}):\n\n${cardsList}`;
+  
+  // Create navigation buttons
+  const buttons = [];
+  if (currentPage > 0) {
+    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+  }
+  if (currentPage < totalPages - 1) {
+    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+  }
+  
+  await ctx.reply(message, {
+    ...getReplyParams(ctx),
+    parse_mode: 'HTML',
+    reply_markup: buttons.length ? {
+      inline_keyboard: [buttons]
+    } : undefined
+  });
+});
+
+// Handle cards pagination
+bot.action('cards:next', async (ctx) => {
+  const userId = ctx.from.id;
+  const currentPage = userCardPages.get(userId) || 0;
+  userCardPages.set(userId, currentPage + 1);
+  
+  // Re-display cards with new page
+  const user = await ensureUser(prisma, ctx.from);
+  const cards = await listUserCards(prisma, user.id);
+  
+  const PAGE_SIZE = 5;
+  const totalPages = Math.ceil(cards.length / PAGE_SIZE);
+  const start = (currentPage + 1) * PAGE_SIZE;
+  const end = start + PAGE_SIZE;
+  const pageCards = cards.slice(start, end);
+  
+  const cardsList = pageCards.map(c => 
+    `${getRarityWithEmoji(c.card.rarity)} ${c.card.name} (ID: ${c.cardId}) x${c.quantity}`
+  ).join('\n');
+  
+  const message = `📇 Your Cards (Page ${currentPage + 2}/${totalPages}):\n\n${cardsList}`;
+  
+  // Update navigation buttons
+  const buttons = [];
+  if (currentPage + 1 > 0) {
+    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+  }
+  if (currentPage + 1 < totalPages - 1) {
+    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+  }
+  
+  await ctx.editMessageText(message, {
+    parse_mode: 'HTML',
+    reply_markup: buttons.length ? {
+      inline_keyboard: [buttons]
+    } : undefined
+  });
+  await ctx.answerCbQuery();
+});
+
+bot.action('cards:prev', async (ctx) => {
+  const userId = ctx.from.id;
+  const currentPage = userCardPages.get(userId) || 0;
+  userCardPages.set(userId, currentPage - 1);
+  
+  // Re-display cards with new page
+  const user = await ensureUser(prisma, ctx.from);
+  const cards = await listUserCards(prisma, user.id);
+  
+  const PAGE_SIZE = 5;
+  const totalPages = Math.ceil(cards.length / PAGE_SIZE);
+  const start = (currentPage - 1) * PAGE_SIZE;
+  const end = start + PAGE_SIZE;
+  const pageCards = cards.slice(start, end);
+  
+  const cardsList = pageCards.map(c => 
+    `${getRarityWithEmoji(c.card.rarity)} ${c.card.name} (ID: ${c.cardId}) x${c.quantity}`
+  ).join('\n');
+  
+  const message = `📇 Your Cards (Page ${currentPage}/${totalPages}):\n\n${cardsList}`;
+  
+  // Update navigation buttons
+  const buttons = [];
+  if (currentPage - 1 > 0) {
+    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+  }
+  if (currentPage - 1 < totalPages - 1) {
+    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+  }
+  
+  await ctx.editMessageText(message, {
+    parse_mode: 'HTML',
+    reply_markup: buttons.length ? {
+      inline_keyboard: [buttons]
+    } : undefined
+  });
+  await ctx.answerCbQuery();
 });
 
 bot.hears('🎁 Daily', async (ctx) => {
@@ -383,21 +487,163 @@ bot.command('cancel', async (ctx) => {
 });
 
 bot.hears('🔁 Trade', async (ctx) => {
-  await ctx.reply('Use: /trade <toUserId> <offeredCardId> <requestedCardId>');
+  await ctx.reply('Reply to a user\'s message with: /trade <offeredCardId> <requestedCardId>');
 });
 
-bot.command('trade', async (ctx) => {
+bot.hears(/^(?:\/)?trade\s+(\d+)\s+(\d+)$/i, async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  const parts = (ctx.message.text || '').split(/\s+/);
-  const toUserId = Number(parts[1]);
-  const offeredCardId = Number(parts[2]);
-  const requestedCardId = Number(parts[3]);
-  if (!toUserId || !offeredCardId || !requestedCardId) return ctx.reply('Usage: /trade <toUserId> <offeredCardId> <requestedCardId>');
+  const offeredCardId = Number(ctx.match[1]);
+  const requestedCardId = Number(ctx.match[2]);
+
+  // Check if this is a reply to someone
+  const replyToMessage = ctx.message.reply_to_message;
+  if (!replyToMessage || !replyToMessage.from) {
+    return ctx.reply('You must reply to a user\'s message to propose a trade.');
+  }
+
+  // Get target user from the replied message
+  const toUserId = replyToMessage.from.id;
+
+  // Check that user is not trying to trade with themselves
+  if (toUserId === ctx.from.id) {
+    return ctx.reply('You cannot trade with yourself.');
+  }
+
   try {
-    const t = await createTrade(prisma, user.id, toUserId, offeredCardId, requestedCardId);
-    await ctx.reply(`Trade proposed (id ${t.id}). Recipient can /accept ${t.id} or /reject ${t.id}.`);
+    // Ensure the target user exists in our database
+    const targetUser = await ensureUser(prisma, replyToMessage.from);
+
+    // Create the trade
+    const t = await createTrade(prisma, user.id, targetUser.id, offeredCardId, requestedCardId);
+    
+    const userMention = replyToMessage.from.username 
+      ? `@${replyToMessage.from.username}`
+      : replyToMessage.from.first_name;
+
+    // Get card details
+    const [offeredCard, requestedCard] = await Promise.all([
+      prisma.card.findUnique({ where: { id: offeredCardId } }),
+      prisma.card.findUnique({ where: { id: requestedCardId } })
+    ]);
+
+    if (!offeredCard || !requestedCard) {
+      throw new Error('One or both cards not found');
+    }
+
+    // Send notification about the trade with inline buttons
+    await ctx.reply(
+      `📨 Trade Proposal\n\n` +
+      `From: ${ctx.from.first_name}\n` +
+      `To: ${userMention}\n\n` +
+      `Offering: ${offeredCard.name} (#${offeredCardId})\n` +
+      `For: ${requestedCard.name} (#${requestedCardId})`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Accept', callback_data: `accept_trade:${t.id}` },
+              { text: '❌ Reject', callback_data: `reject_trade:${t.id}` }
+            ]
+          ]
+        }
+      }
+    );
   } catch (e: any) {
     await ctx.reply(`Trade failed: ${e.message}`);
+  }
+});
+
+// Handle inline button callbacks for trades
+bot.action(/accept_trade:(\d+)/, async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const tradeId = Number(ctx.match[1]);
+  
+  try {
+    // Get trade details first
+    const trade = await prisma.trade.findUnique({
+      where: { id: tradeId },
+      include: {
+        fromUser: true,
+        toUser: true,
+        offeredCard: true,
+        requestedCard: true
+      }
+    });
+
+    if (!trade) {
+      await ctx.answerCbQuery('Trade not found.');
+      return;
+    }
+
+    // Check if this user is the trade recipient
+    if (trade.toUserId !== user.id) {
+      await ctx.answerCbQuery('Only the trade recipient can accept the trade.');
+      return;
+    }
+
+    const res = await acceptTrade(prisma, tradeId, user.id);
+    if (res.ok) {
+      // Construct user reference
+      const fromUserRef = trade.fromUser.username 
+        ? `@${trade.fromUser.username}`
+        : trade.fromUser.firstName || 'User';
+
+      await ctx.editMessageText(
+        `✅ Trade accepted!\n` +
+        `Received Card #${trade.offeredCard.id} (${trade.offeredCard.name}) from ${fromUserRef}\n` +
+        `Sent Card #${trade.requestedCard.id} (${trade.requestedCard.name})`
+      );
+      await ctx.answerCbQuery('Trade accepted successfully!');
+    }
+  } catch (e: any) {
+    await ctx.answerCbQuery(`Accept failed: ${e.message}`);
+  }
+});
+
+bot.action(/reject_trade:(\d+)/, async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const tradeId = Number(ctx.match[1]);
+  
+  try {
+    // Get trade details first
+    const trade = await prisma.trade.findUnique({
+      where: { id: tradeId },
+      include: {
+        fromUser: true,
+        toUser: true,
+        offeredCard: true,
+        requestedCard: true
+      }
+    });
+
+    if (!trade) {
+      await ctx.answerCbQuery('Trade not found.');
+      return;
+    }
+
+    // Check if this user is the trade recipient
+    if (trade.toUserId !== user.id) {
+      await ctx.answerCbQuery('Only the trade recipient can reject the trade.');
+      return;
+    }
+
+    const res = await rejectTrade(prisma, tradeId, user.id);
+    if (res.ok) {
+      // Construct user reference
+      const fromUserRef = trade.fromUser.username 
+        ? `@${trade.fromUser.username}`
+        : trade.fromUser.firstName || 'User';
+
+      await ctx.editMessageText(
+        `❌ Trade rejected.\n` +
+        `Declined offer from ${fromUserRef}:\n` +
+        `Their Card #${trade.offeredCard.id} (${trade.offeredCard.name})\n` +
+        `For Your Card #${trade.requestedCard.id} (${trade.requestedCard.name})`
+      );
+      await ctx.answerCbQuery('Trade rejected successfully!');
+    }
+  } catch (e: any) {
+    await ctx.answerCbQuery(`Reject failed: ${e.message}`);
   }
 });
 
@@ -405,10 +651,36 @@ bot.command('accept', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const parts = (ctx.message.text || '').split(/\s+/);
   const tradeId = Number(parts[1]);
-  if (!tradeId) return ctx.reply('Usage: /accept <tradeId>');
+  if (!tradeId) return ctx.reply('Please use the Accept button on the trade message instead.');
   try {
+    // Get trade details first
+    const trade = await prisma.trade.findUnique({
+      where: { id: tradeId },
+      include: {
+        fromUser: true,
+        toUser: true,
+        offeredCard: true,
+        requestedCard: true
+      }
+    });
+
+    if (!trade) {
+      return ctx.reply('Trade not found.');
+    }
+
     const res = await acceptTrade(prisma, tradeId, user.id);
-    if (res.ok) await ctx.reply('Trade accepted.');
+    if (res.ok) {
+      // Construct user references
+      const fromUserRef = trade.fromUser.username 
+        ? `@${trade.fromUser.username}`
+        : trade.fromUser.firstName || 'User';
+
+      await ctx.reply(
+        `Trade accepted!\n` +
+        `Received Card #${trade.offeredCard.id} (${trade.offeredCard.name}) from ${fromUserRef}\n` +
+        `Sent Card #${trade.requestedCard.id} (${trade.requestedCard.name})`
+      );
+    }
   } catch (e: any) {
     await ctx.reply(`Accept failed: ${e.message}`);
   }
@@ -418,10 +690,36 @@ bot.command('reject', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const parts = (ctx.message.text || '').split(/\s+/);
   const tradeId = Number(parts[1]);
-  if (!tradeId) return ctx.reply('Usage: /reject <tradeId>');
+  if (!tradeId) return ctx.reply('Please use the Reject button on the trade message instead.');
   try {
+    // Get trade details first
+    const trade = await prisma.trade.findUnique({
+      where: { id: tradeId },
+      include: {
+        fromUser: true,
+        offeredCard: true,
+        requestedCard: true
+      }
+    });
+
+    if (!trade) {
+      return ctx.reply('Trade not found.');
+    }
+
     const res = await rejectTrade(prisma, tradeId, user.id);
-    if (res.ok) await ctx.reply('Trade rejected.');
+    if (res.ok) {
+      // Construct user reference
+      const fromUserRef = trade.fromUser.username 
+        ? `@${trade.fromUser.username}`
+        : trade.fromUser.firstName || 'User';
+
+      await ctx.reply(
+        `Trade rejected.\n` +
+        `Declined offer from ${fromUserRef}:\n` +
+        `Their Card #${trade.offeredCard.id} (${trade.offeredCard.name})\n` +
+        `For Your Card #${trade.requestedCard.id} (${trade.requestedCard.name})`
+      );
+    }
   } catch (e: any) {
     await ctx.reply(`Reject failed: ${e.message}`);
   }
@@ -429,9 +727,74 @@ bot.command('reject', async (ctx) => {
 
 bot.command('trades', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  const trades = await myTrades(prisma, user.id);
+  
+  // Get trades with full card and user details
+  const trades = await prisma.trade.findMany({
+    where: {
+      OR: [
+        { fromUserId: user.id },
+        { toUserId: user.id }
+      ]
+    },
+    include: {
+      fromUser: true,
+      toUser: true,
+      offeredCard: true,
+      requestedCard: true
+    },
+    orderBy: {
+      createdAt: 'desc'
+    }
+  });
+
   if (trades.length === 0) return ctx.reply('No trades.');
-  await ctx.reply(trades.map(t => `#${t.id} from ${t.fromUserId} to ${t.toUserId} | offered ${t.offeredCardId} for ${t.requestedCardId} [${t.status}]`).join('\n'));
+
+  const tradeMessages = trades.map(t => {
+    const isOutgoing = t.fromUserId === user.id;
+    const otherUser = isOutgoing ? t.toUser : t.fromUser;
+    const otherUserRef = otherUser.username 
+      ? `@${otherUser.username}`
+      : otherUser.firstName || 'User';
+
+    return `Trade #${t.id} [${t.status}]\n` +
+           `${isOutgoing ? 'To' : 'From'}: ${otherUserRef}\n` +
+           `${isOutgoing ? 'Offering' : 'Offered'}: #${t.offeredCard.id} (${t.offeredCard.name})\n` +
+           `${isOutgoing ? 'For Their' : 'For Your'}: #${t.requestedCard.id} (${t.requestedCard.name})\n`;
+  });
+
+  await ctx.reply(tradeMessages.join('\n'));
+});
+
+// Admin command to set the card drop rate for a group
+bot.command('droprate', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin({ id: user.id })) {
+    return ctx.reply('Only admins can use this command.');
+  }
+
+  // Only work in group chats
+  if (!ctx.chat || ctx.chat.type === 'private') {
+    return ctx.reply('This command only works in group chats.');
+  }
+
+  const parts = ctx.message.text.split(' ');
+  const chatId = ctx.chat.id;
+  
+  if (parts.length === 1) {
+    const currentRate = groupDropRates.get(chatId) || DEFAULT_DROP_RATE;
+    return ctx.reply(`Current drop rate: every ${currentRate} messages`);
+  }
+
+  if (isNaN(Number(parts[1])) || Number(parts[1]) < 1) {
+    return ctx.reply('Usage: /droprate <number>\nNumber must be positive.');
+  }
+
+  const newDropRate = Math.floor(Number(parts[1]));
+  groupDropRates.set(chatId, newDropRate);
+  // Reset message count to avoid unexpected drops
+  groupMessageCount.set(chatId, 0);
+
+  await ctx.reply(`Card drop rate set to every ${newDropRate} messages.`);
 });
 
 bot.command('help', async (ctx) => {
@@ -439,7 +802,7 @@ bot.command('help', async (ctx) => {
   const isUserAdmin = await isAdmin({ id: user.id });
   let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /accept, /reject, /trades';
   if (isUserAdmin) {
-    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user';
+    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
   }
   await ctx.reply(helpText);
 });
@@ -480,7 +843,7 @@ bot.command('makeadmin', async (ctx) => {
     
     await prisma.user.update({
       where: { id: targetUser.id },
-      data: { isAdmin: true }
+      data: { isAdmin: true } as any
     });
     
     // Construct user reference for the message
@@ -534,7 +897,7 @@ bot.command('removeadmin', async (ctx) => {
     
     await prisma.user.update({
       where: { id: targetUser.id },
-      data: { isAdmin: false }
+      data: { isAdmin: false } as any
     });
     
     // Construct user reference for the message
@@ -638,8 +1001,13 @@ bot.command('changeimage', async (ctx) => {
 
 // --- Group card drop feature ---
 
-// In-memory maps to track group message counts and active card drops
+// In-memory maps to track group message counts, drop rates, and active card drops
 const groupMessageCount: Map<number, number> = new Map();
+const groupDropRates: Map<number, number> = new Map();
+const DEFAULT_DROP_RATE = 10;
+// Store user's current page for cards command
+const userCardPages = new Map<number, number>();
+
 const activeCardDrops: Map<number, {
   id: number;
   name: string;
@@ -722,8 +1090,11 @@ bot.on("message", async (ctx, next) => {
     count += 1;
     groupMessageCount.set(chatId, count);
 
-    // Drop a new card every 10 messages, regardless of whether the previous one was collected
-    if (count % 10 === 0) {
+    // Get the drop rate for this chat, or use default
+    const dropRate = groupDropRates.get(chatId) || DEFAULT_DROP_RATE;
+    
+    // Drop a new card when message count reaches the drop rate
+    if (count % dropRate === 0) {
       // Clear any existing card drop before adding a new one
       if (activeCardDrops.has(chatId)) {
         const previousCard = activeCardDrops.get(chatId);
