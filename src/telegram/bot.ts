@@ -371,6 +371,108 @@ bot.action('cards:next', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
+// Handle gift acceptance
+bot.action(/accept_gift:(.+)/, async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const giftId = ctx.match[1];
+  
+  try {
+    const gift = pendingGifts.get(giftId);
+    if (!gift) {
+      await ctx.answerCbQuery('Gift not found or expired.');
+      return;
+    }
+
+    // Check if this user is the gift sender
+    if (gift.fromUserId !== user.id) {
+      await ctx.answerCbQuery('Only the gift sender can confirm the gift.');
+      return;
+    }
+
+    // Transfer the card
+    await prisma.$transaction(async (tx) => {
+      // Decrease sender's quantity
+      const senderOwnership = await tx.ownership.findUnique({
+        where: { userId_cardId: { userId: gift.fromUserId, cardId: gift.cardId } },
+        include: { card: true }
+      });
+
+      if (!senderOwnership || senderOwnership.quantity < 1) {
+        throw new Error('Sender no longer has this card.');
+      }
+
+      await tx.ownership.update({
+        where: { id: senderOwnership.id },
+        data: { quantity: { decrement: 1 } }
+      });
+
+      // Increase recipient's quantity or create new ownership
+      const recipientOwnership = await tx.ownership.findUnique({
+        where: { userId_cardId: { userId: gift.toUserId, cardId: gift.cardId } }
+      });
+
+      if (recipientOwnership) {
+        await tx.ownership.update({
+          where: { id: recipientOwnership.id },
+          data: { quantity: { increment: 1 } }
+        });
+      } else {
+        await tx.ownership.create({
+          data: {
+            userId: gift.toUserId,
+            cardId: gift.cardId,
+            quantity: 1
+          }
+        });
+      }
+
+      // Remove the pending gift
+      pendingGifts.delete(giftId);
+
+      await ctx.editMessageText(
+        `✅ Gift Sent!\n\n` +
+        `Card: ${senderOwnership.card.name} (#${gift.cardId})\n` +
+        `To: Player #${gift.toUserId}`
+      );
+    });
+
+    await ctx.answerCbQuery('Gift sent successfully!');
+  } catch (e: any) {
+    await ctx.answerCbQuery(`Gift acceptance failed: ${e.message}`);
+  }
+});
+
+// Handle gift rejection
+bot.action(/reject_gift:(.+)/, async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const giftId = ctx.match[1];
+  
+  try {
+    const gift = pendingGifts.get(giftId);
+    if (!gift) {
+      await ctx.answerCbQuery('Gift not found or expired.');
+      return;
+    }
+
+    // Check if this user is the gift sender
+    if (gift.fromUserId !== user.id) {
+      await ctx.answerCbQuery('Only the gift sender can cancel the gift.');
+      return;
+    }
+
+    // Remove the pending gift
+    pendingGifts.delete(giftId);
+
+    await ctx.editMessageText(
+      `❌ Gift Rejected\n\n` +
+      `Card #${gift.cardId} gift was declined.`
+    );
+    await ctx.answerCbQuery('Gift rejected successfully.');
+  } catch (e: any) {
+    await ctx.answerCbQuery(`Gift rejection failed: ${e.message}`);
+  }
+});
+
 bot.action('cards:prev', async (ctx) => {
   const userId = ctx.from.id;
   const currentPage = userCardPages.get(userId) || 0;
@@ -836,10 +938,95 @@ bot.command('droprate', async (ctx) => {
   await ctx.reply(`Card drop rate set to every ${newDropRate} messages.`);
 });
 
+bot.command('gift', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  
+  // Check if command is a reply to someone's message
+  const replyToMessage = ctx.message.reply_to_message;
+  if (!replyToMessage || !replyToMessage.from) {
+    return ctx.reply('You must reply to a user\'s message to gift a card.\nUsage: Reply with /gift <cardId>');
+  }
+
+  // Parse command parameters
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+
+  if (!cardId) {
+    return ctx.reply('Usage: Reply with /gift <cardId>');
+  }
+
+  // Get target user from the replied message
+  const toUserId = replyToMessage.from.id;
+
+  // Check that user is not trying to gift to themselves
+  if (toUserId === ctx.from.id) {
+    return ctx.reply('You cannot gift a card to yourself.');
+  }
+
+  try {
+    // Check if user owns the card
+    const ownership = await prisma.ownership.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      },
+      include: {
+        card: true
+      }
+    });
+
+    if (!ownership) {
+      return ctx.reply('You don\'t own this card.');
+    }
+
+    if (ownership.quantity < 1) {
+      return ctx.reply('You don\'t have enough copies of this card to gift.');
+    }
+
+    // Ensure the target user exists in our database
+    const targetUser = await ensureUser(prisma, replyToMessage.from);
+
+    const userMention = replyToMessage.from.username 
+      ? `@${replyToMessage.from.username}`
+      : replyToMessage.from.first_name;
+
+    // Store gift details in memory
+    const giftId = Date.now().toString();
+    pendingGifts.set(giftId, {
+      fromUserId: user.id,
+      toUserId: targetUser.id,
+      cardId: cardId
+    });
+
+    // Send gift proposal with buttons
+    await ctx.reply(
+      `🎁 Gift Proposal\n\n` +
+      `To: ${userMention}\n` +
+      `Card: ${ownership.card.name} (#${cardId})\n` +
+      `Rarity: ${getRarityWithEmoji(ownership.card.rarity)}\n\n` +
+      `Do you want to confirm this gift?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Confirm Gift', callback_data: `accept_gift:${giftId}` },
+              { text: '❌ Cancel', callback_data: `reject_gift:${giftId}` }
+            ]
+          ]
+        }
+      }
+    );
+  } catch (e: any) {
+    await ctx.reply(`Gift failed: ${e.message}`);
+  }
+});
+
 bot.command('help', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const isUserAdmin = await isAdmin({ id: user.id });
-  let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /accept, /reject, /trades';
+  let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades';
   if (isUserAdmin) {
     helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
   }
@@ -1046,6 +1233,8 @@ const groupDropRates: Map<number, number> = new Map();
 const DEFAULT_DROP_RATE = 10;
 // Store user's current page for cards command
 const userCardPages = new Map<number, number>();
+// Store pending gift proposals
+const pendingGifts = new Map<string, { fromUserId: number; toUserId: number; cardId: number; }>();
 
 const activeCardDrops: Map<number, {
   id: number;
