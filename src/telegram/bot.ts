@@ -191,8 +191,50 @@ bot.command('deletecard', async (ctx) => {
   const cardId = Number(parts[1]);
   if (!cardId) return ctx.reply('Usage: /deletecard <cardId>', { ...getReplyParams(ctx) });
   try {
-    const deleted = await prisma.card.delete({ where: { id: cardId } });
-    await ctx.reply(`Card deleted: ${deleted.name} (${deleted.rarity})`, { ...getReplyParams(ctx) });
+    // Delete all related data in a transaction
+    const deleted = await prisma.$transaction(async (tx) => {
+      // First get the card to ensure it exists
+      const card = await tx.card.findUnique({
+        where: { id: cardId },
+        include: {
+          ownerships: true,
+          listings: true,
+          offeredTrades: true,
+          requestedTrades: true
+        }
+      });
+
+      if (!card) {
+        throw new Error('Card not found');
+      }
+
+      // Delete all related listings
+      await tx.listing.deleteMany({
+        where: { cardId }
+      });
+
+      // Delete all ownerships
+      await tx.ownership.deleteMany({
+        where: { cardId }
+      });
+
+      // Delete all trades where this card is involved
+      await tx.trade.deleteMany({
+        where: {
+          OR: [
+            { offeredCardId: cardId },
+            { requestedCardId: cardId }
+          ]
+        }
+      });
+
+      // Finally delete the card
+      return await tx.card.delete({
+        where: { id: cardId }
+      });
+    });
+
+    await ctx.reply(`Card deleted: ${deleted.name} (${deleted.rarity})\nAll related trades, listings, and ownerships have been removed.`, { ...getReplyParams(ctx) });
   } catch (e: any) {
     await ctx.reply(`Error deleting card: ${e.message}`, { ...getReplyParams(ctx) });
   }
@@ -473,6 +515,42 @@ bot.action(/reject_gift:(.+)/, async (ctx) => {
   }
 });
 
+// Handle rarity selection callback
+bot.action(/^cards_rarity:(.+)$/, async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const rarity = ctx.match[1];
+  
+  // Get cards of selected rarity
+  const cards = await prisma.ownership.findMany({
+    where: {
+      userId: user.id,
+      card: {
+        rarity: rarity
+      }
+    },
+    include: {
+      card: true
+    },
+    orderBy: {
+      cardId: 'asc'
+    }
+  });
+
+  if (cards.length === 0) {
+    await ctx.answerCbQuery();
+    return ctx.editMessageText(`You don't have any ${rarity.toLowerCase()} cards.`);
+  }
+
+  const cardsList = cards.map(ownership => 
+    `${getRarityWithEmoji(ownership.card.rarity)} ${ownership.card.name} (ID: ${ownership.cardId}) x${ownership.quantity}`
+  ).join('\n');
+
+  const message = `Your ${rarity} Cards:\n\n${cardsList}`;
+
+  await ctx.answerCbQuery();
+  await ctx.editMessageText(message, { parse_mode: 'HTML' });
+});
+
 bot.action('cards:prev', async (ctx) => {
   const userId = ctx.from.id;
   const currentPage = userCardPages.get(userId) || 0;
@@ -512,9 +590,77 @@ bot.action('cards:prev', async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-// Also handle /cards command
+// Handle /cards command with different modes
 bot.command('cards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
+  const parts = (ctx.message.text || '').split(/\s+/);
+  
+  // Case 1: /cards rarity - Show rarity selection buttons
+  if (parts[1]?.toLowerCase() === 'rarity') {
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '🥉 Common', callback_data: 'cards_rarity:COMMON' },
+          { text: '🥈 Medium', callback_data: 'cards_rarity:MEDIUM' }
+        ],
+        [
+          { text: '🥇 Rare', callback_data: 'cards_rarity:RARE' },
+          { text: '🟡 Legendary', callback_data: 'cards_rarity:LEGENDARY' }
+        ],
+        [
+          { text: '💮 Exclusive', callback_data: 'cards_rarity:EXCLUSIVE' },
+          { text: '🔮 Limited Edition', callback_data: 'cards_rarity:LIMITED' }
+        ],
+        [
+          { text: '💠 Cosmic', callback_data: 'cards_rarity:COSMIC' },
+          { text: '♠️ Prime', callback_data: 'cards_rarity:PRIME' }
+        ],
+        [
+          { text: '🧿 Premium', callback_data: 'cards_rarity:PREMIUM' }
+        ]
+      ]
+    };
+    
+    return await ctx.reply('Select a rarity to view your cards:', {
+      reply_markup: keyboard
+    });
+  }
+
+  // Case 2: /cards <card_id> - Show specific card count
+  const cardId = Number(parts[1]);
+  if (!isNaN(cardId)) {
+    // First check if the card exists
+    const card = await prisma.card.findUnique({
+      where: { id: cardId }
+    });
+
+    if (!card) {
+      return ctx.reply(`Card #${cardId} does not exist.`);
+    }
+
+    // Then check if user owns it
+    const ownership = await prisma.ownership.findFirst({
+      where: {
+        userId: user.id,
+        cardId: cardId
+      },
+      include: {
+        card: true
+      }
+    });
+
+    if (!ownership) {
+      return ctx.reply(`You don't own card #${cardId}.`);
+    }
+
+    return ctx.reply(
+      `Card #${cardId}: ${ownership.card.name}\n` +
+      `Rarity: ${getRarityWithEmoji(ownership.card.rarity)}\n` +
+      `Quantity: x${ownership.quantity}`
+    );
+  }
+
+  // Case 3: /cards - Show all cards (paginated)
   const cards = await listUserCards(prisma, user.id);
   if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!', { ...getReplyParams(ctx) });
   
