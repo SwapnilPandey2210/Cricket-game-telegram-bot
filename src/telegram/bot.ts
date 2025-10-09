@@ -296,11 +296,9 @@ bot.hears('📇 My Cards', async (ctx) => {
   const cards = await listUserCards(prisma, user.id);
   if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!', { ...getReplyParams(ctx) });
   
-  // Get or initialize user's current page
+  // Always start from first page when button is clicked
   const userId = ctx.from.id;
-  if (!userCardPages.has(userId)) {
-    userCardPages.set(userId, 0);
-  }
+  userCardPages.set(userId, 0);
   
   const PAGE_SIZE = 5;
   const totalPages = Math.ceil(cards.length / PAGE_SIZE);
@@ -410,6 +408,47 @@ bot.action('cards:prev', async (ctx) => {
     } : undefined
   });
   await ctx.answerCbQuery();
+});
+
+// Also handle /cards command
+bot.command('cards', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const cards = await listUserCards(prisma, user.id);
+  if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!', { ...getReplyParams(ctx) });
+  
+  // Always start from first page when command is used
+  const userId = ctx.from.id;
+  userCardPages.set(userId, 0);
+  
+  const PAGE_SIZE = 5;
+  const totalPages = Math.ceil(cards.length / PAGE_SIZE);
+  const currentPage = userCardPages.get(userId) || 0;
+  const start = currentPage * PAGE_SIZE;
+  const end = start + PAGE_SIZE;
+  const pageCards = cards.slice(start, end);
+  
+  const cardsList = pageCards.map(c => 
+    `${getRarityWithEmoji(c.card.rarity)} ${c.card.name} (ID: ${c.cardId}) x${c.quantity}`
+  ).join('\n');
+  
+  const message = `📇 Your Cards (Page ${currentPage + 1}/${totalPages}):\n\n${cardsList}`;
+  
+  // Create navigation buttons
+  const buttons = [];
+  if (currentPage > 0) {
+    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+  }
+  if (currentPage < totalPages - 1) {
+    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+  }
+  
+  await ctx.reply(message, {
+    ...getReplyParams(ctx),
+    parse_mode: 'HTML',
+    reply_markup: buttons.length ? {
+      inline_keyboard: [buttons]
+    } : undefined
+  });
 });
 
 bot.hears('🎁 Daily', async (ctx) => {
