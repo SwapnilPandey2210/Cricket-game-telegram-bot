@@ -1403,8 +1403,200 @@ bot.command('cards', async (ctx) => {
 
 bot.command('profile', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  await ctx.reply(`User: @${user.username ?? 'anon'}\nCoins: ${user.coins}`);
+  
+  // Get user's card ownership data
+  const ownerships = await prisma.ownership.findMany({
+    where: { userId: user.id },
+    include: { card: true }
+  });
+  
+  // Calculate statistics
+  const totalCardsOwned = ownerships.reduce((sum, ownership) => sum + ownership.quantity, 0);
+  const totalUniqueCards = ownerships.length;
+  
+  // Calculate total cards collected (this would be the same as total cards owned currently
+  // since we don't have a separate field for cards that were traded away)
+  const totalCardsCollected = totalCardsOwned;
+  
+  // Group cards by rarity
+  const cardsByRarity: { [key: string]: { total: number; unique: number } } = {};
+  
+  ownerships.forEach(ownership => {
+    const rarity = ownership.card.rarity;
+    if (!cardsByRarity[rarity]) {
+      cardsByRarity[rarity] = { total: 0, unique: 0 };
+    }
+    cardsByRarity[rarity].total += ownership.quantity;
+    cardsByRarity[rarity].unique += 1;
+  });
+  
+  // Build profile message
+  const username = user.firstName || user.username || 'Anonymous';
+  let profileMessage = `<b>👤 Profile</b>\n\n`;
+  profileMessage += `<b>Username:</b> ${username}\n`;
+  profileMessage += `<b>Total Cards Collected:</b> ${totalCardsCollected}\n`;
+  profileMessage += `<b>Total Unique Cards Owned:</b> ${totalUniqueCards}\n`;
+  profileMessage += `<b>Total Cards Owned:</b> ${totalCardsOwned}\n`;
+  profileMessage += `<b>Total Coins:</b> ${user.coins}\n\n`;
+  
+  // Add rarity breakdown
+  if (Object.keys(cardsByRarity).length > 0) {
+    profileMessage += `<b>📊 Cards by Rarity:</b>\n`;
+    Object.entries(cardsByRarity)
+      .sort(([a], [b]) => {
+        // Sort by rarity order (you can customize this order)
+        const rarityOrder = ['COMMON', 'MEDIUM', 'RARE', 'LEGENDARY', 'EXCLUSIVE', 'LIMITED_EDITION', 'COSMIC', 'PRIME', 'PREMIUM'];
+        return rarityOrder.indexOf(a) - rarityOrder.indexOf(b);
+      })
+      .forEach(([rarity, stats]) => {
+        const emoji = RARITY_EMOJIS[rarity] || '⭐';
+        profileMessage += `${emoji} ${rarity}: ${stats.total} cards (${stats.unique} unique)\n`;
+      });
+  } else {
+    profileMessage += `<b>📊 Cards by Rarity:</b>\nNo cards owned yet.`;
+  }
+  
+  await ctx.replyWithHTML(profileMessage, { ...getReplyParams(ctx) });
 });
+
+// Fuse command: /fuse card_id or /fuse rarity
+bot.command('fuse', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const parts = (ctx.message.text || '').split(/\s+/);
+  
+  if (parts.length < 2) {
+    await ctx.reply('Usage: /fuse <card_id> or /fuse <rarity>\n\nExamples:\n/fuse 123 - Fuse all cards of card ID 123\n/fuse legendary - Fuse all legendary cards', { ...getReplyParams(ctx) });
+    return;
+  }
+  
+  const input = parts[1].toLowerCase();
+  
+  // Check if input is a number (card_id)
+  const cardId = Number(input);
+  if (!isNaN(cardId)) {
+    // Fuse specific card by ID
+    await handleFuseCardById(ctx, user, cardId);
+  } else {
+    // Fuse by rarity
+    await handleFuseByRarity(ctx, user, input);
+  }
+});
+
+// Helper function to handle fusing specific card by ID
+async function handleFuseCardById(ctx: any, user: any, cardId: number) {
+  try {
+    // Check if user owns this card
+    const ownership = await prisma.ownership.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      },
+      include: { card: true }
+    });
+    
+    if (!ownership) {
+      await ctx.reply(`You don't own any cards with ID ${cardId}.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    const card = ownership.card;
+    const quantity = ownership.quantity;
+    const rarity = card.rarity;
+    const rate = RARITY_FUSE_RATES[rarity] || 0;
+    const totalCoins = quantity * rate;
+    
+    if (rate === 0) {
+      await ctx.reply(`Unknown rarity: ${rarity}. Cannot fuse this card.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Create confirmation message
+    const emoji = RARITY_EMOJIS[rarity] || '⭐';
+    const confirmMessage = `🔥 <b>Fuse Confirmation</b>\n\n` +
+      `Card: ${emoji} ${card.name} (ID: ${cardId})\n` +
+      `Rarity: ${rarity}\n` +
+      `Quantity: ${quantity} cards\n` +
+      `Rate: ${rate} coins per card\n` +
+      `Total coins: ${totalCoins}\n\n` +
+      `Are you sure you want to fuse all ${quantity} cards of this type?`;
+    
+    await ctx.replyWithHTML(confirmMessage, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ Confirm Fuse', callback_data: `fuse_confirm_card_${cardId}` },
+            { text: '❌ Cancel', callback_data: 'fuse_cancel' }
+          ]
+        ]
+      },
+      ...getReplyParams(ctx)
+    });
+    
+  } catch (error) {
+    console.error('Error in handleFuseCardById:', error);
+    await ctx.reply('An error occurred while processing the fuse request.', { ...getReplyParams(ctx) });
+  }
+}
+
+// Helper function to handle fusing by rarity
+async function handleFuseByRarity(ctx: any, user: any, rarityInput: string) {
+  try {
+    // Normalize rarity input
+    const rarity = rarityInput.toUpperCase();
+    
+    if (!RARITY_FUSE_RATES[rarity]) {
+      const validRarities = Object.keys(RARITY_FUSE_RATES).join(', ');
+      await ctx.reply(`Invalid rarity: ${rarityInput}\n\nValid rarities: ${validRarities}`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Get all cards of this rarity owned by user
+    const ownerships = await prisma.ownership.findMany({
+      where: { userId: user.id },
+      include: { card: true }
+    });
+    
+    const cardsOfRarity = ownerships.filter(ownership => ownership.card.rarity === rarity);
+    
+    if (cardsOfRarity.length === 0) {
+      await ctx.reply(`You don't own any ${rarity} cards.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    const totalQuantity = cardsOfRarity.reduce((sum, ownership) => sum + ownership.quantity, 0);
+    const rate = RARITY_FUSE_RATES[rarity];
+    const totalCoins = totalQuantity * rate;
+    const uniqueCards = cardsOfRarity.length;
+    
+    // Create confirmation message
+    const emoji = RARITY_EMOJIS[rarity] || '⭐';
+    const confirmMessage = `🔥 <b>Fuse Confirmation</b>\n\n` +
+      `Rarity: ${emoji} ${rarity}\n` +
+      `Unique cards: ${uniqueCards}\n` +
+      `Total quantity: ${totalQuantity} cards\n` +
+      `Rate: ${rate} coins per card\n` +
+      `Total coins: ${totalCoins}\n\n` +
+      `Are you sure you want to fuse all ${rarity} cards?`;
+    
+    await ctx.replyWithHTML(confirmMessage, {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '✅ Confirm Fuse', callback_data: `fuse_confirm_rarity_${rarity}` },
+            { text: '❌ Cancel', callback_data: 'fuse_cancel' }
+          ]
+        ]
+      },
+      ...getReplyParams(ctx)
+    });
+    
+  } catch (error) {
+    console.error('Error in handleFuseByRarity:', error);
+    await ctx.reply('An error occurred while processing the fuse request.', { ...getReplyParams(ctx) });
+  }
+}
 
 // Add player to market: /addpmarket card_id price
 bot.command('addpmarket', async (ctx) => {
@@ -1498,6 +1690,21 @@ const RARITY_EMOJIS: {
   'COSMIC': '💠',
   'PRIME': '♠️',
   'PREMIUM': '🧿'
+};
+
+// Rarity fuse rates mapping (coins per card)
+const RARITY_FUSE_RATES: {
+  [key: string]: number;
+} = {
+  'COMMON': 10,
+  'MEDIUM': 20,
+  'RARE': 50,
+  'LEGENDARY': 100,
+  'EXCLUSIVE': 200,
+  'LIMITED_EDITION': 1000,
+  'COSMIC': 10000,
+  'PRIME': 100000,
+  'PREMIUM': 1000000 // Adding premium rate for completeness
 };
 
 // Function to get emoji for a rarity
@@ -1746,22 +1953,164 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
   return true;
 }
 
+// Helper function to handle fuse confirmation for specific card
+async function handleFuseConfirmCard(ctx: any) {
+  try {
+    const data = ctx.callbackQuery.data;
+    const cardId = Number(data.replace('fuse_confirm_card_', ''));
+    const user = await ensureUser(prisma, ctx.from);
+    
+    // Get ownership details
+    const ownership = await prisma.ownership.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      },
+      include: { card: true }
+    });
+    
+    if (!ownership) {
+      await ctx.answerCbQuery("Card not found in your collection.");
+      await ctx.editMessageText("❌ Card not found in your collection.");
+      return;
+    }
+    
+    const card = ownership.card;
+    const quantity = ownership.quantity;
+    const rarity = card.rarity;
+    const rate = RARITY_FUSE_RATES[rarity] || 0;
+    const totalCoins = quantity * rate;
+    
+    // Remove the ownership record
+    await prisma.ownership.delete({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      }
+    });
+    
+    // Add coins to user
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { coins: { increment: totalCoins } }
+    });
+    
+    // Update user object for display
+    user.coins += totalCoins;
+    
+    const emoji = RARITY_EMOJIS[rarity] || '⭐';
+    const successMessage = `🔥 <b>Fuse Successful!</b>\n\n` +
+      `Card: ${emoji} ${card.name} (ID: ${cardId})\n` +
+      `Rarity: ${rarity}\n` +
+      `Fused: ${quantity} cards\n` +
+      `Coins received: ${totalCoins}\n` +
+      `New balance: ${user.coins} coins`;
+    
+    await ctx.answerCbQuery("Cards fused successfully!");
+    await ctx.editMessageText(successMessage, { parse_mode: 'HTML' });
+    
+  } catch (error) {
+    console.error('Error in handleFuseConfirmCard:', error);
+    await ctx.answerCbQuery("An error occurred during fusion.");
+    await ctx.editMessageText("❌ An error occurred during fusion.");
+  }
+}
+
+// Helper function to handle fuse confirmation for rarity
+async function handleFuseConfirmRarity(ctx: any) {
+  try {
+    const data = ctx.callbackQuery.data;
+    const rarity = data.replace('fuse_confirm_rarity_', '');
+    const user = await ensureUser(prisma, ctx.from);
+    
+    // Get all cards of this rarity owned by user
+    const ownerships = await prisma.ownership.findMany({
+      where: { userId: user.id },
+      include: { card: true }
+    });
+    
+    const cardsOfRarity = ownerships.filter(ownership => ownership.card.rarity === rarity);
+    
+    if (cardsOfRarity.length === 0) {
+      await ctx.answerCbQuery("No cards of this rarity found.");
+      await ctx.editMessageText("❌ No cards of this rarity found.");
+      return;
+    }
+    
+    const totalQuantity = cardsOfRarity.reduce((sum, ownership) => sum + ownership.quantity, 0);
+    const rate = RARITY_FUSE_RATES[rarity];
+    const totalCoins = totalQuantity * rate;
+    const uniqueCards = cardsOfRarity.length;
+    
+    // Remove all ownership records for this rarity
+    const cardIds = cardsOfRarity.map(ownership => ownership.cardId);
+    await prisma.ownership.deleteMany({
+      where: {
+        userId: user.id,
+        cardId: { in: cardIds }
+      }
+    });
+    
+    // Add coins to user
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { coins: { increment: totalCoins } }
+    });
+    
+    // Update user object for display
+    user.coins += totalCoins;
+    
+    const emoji = RARITY_EMOJIS[rarity] || '⭐';
+    const successMessage = `🔥 <b>Fuse Successful!</b>\n\n` +
+      `Rarity: ${emoji} ${rarity}\n` +
+      `Unique cards: ${uniqueCards}\n` +
+      `Fused: ${totalQuantity} cards\n` +
+      `Coins received: ${totalCoins}\n` +
+      `New balance: ${user.coins} coins`;
+    
+    await ctx.answerCbQuery("Cards fused successfully!");
+    await ctx.editMessageText(successMessage, { parse_mode: 'HTML' });
+    
+  } catch (error) {
+    console.error('Error in handleFuseConfirmRarity:', error);
+    await ctx.answerCbQuery("An error occurred during fusion.");
+    await ctx.editMessageText("❌ An error occurred during fusion.");
+  }
+}
+
 // Updated Callback query handler to show complete card details
 bot.on("callback_query", async (ctx, next) => {
-  if ('data' in ctx.callbackQuery && ctx.callbackQuery.data === "check_card") {
-    const userId = ctx.callbackQuery.from.id;
-    let cardFound = false;
-    // Iterate over active card drops to find an uncollected card
-    for (const [chatId, card] of activeCardDrops.entries()) {
-      if (!card.collected) {
-        cardFound = await sendCardDetails(ctx, card, chatId);
-        break;
+  if ('data' in ctx.callbackQuery) {
+    const data = ctx.callbackQuery.data;
+    
+    if (data === "check_card") {
+      const userId = ctx.callbackQuery.from.id;
+      let cardFound = false;
+      // Iterate over active card drops to find an uncollected card
+      for (const [chatId, card] of activeCardDrops.entries()) {
+        if (!card.collected) {
+          cardFound = await sendCardDetails(ctx, card, chatId);
+          break;
+        }
       }
-    }
-    if (!cardFound) {
-      await ctx.answerCbQuery("No active card drop available.");
+      if (!cardFound) {
+        await ctx.answerCbQuery("No active card drop available.");
+      } else {
+        await ctx.answerCbQuery("Card details sent in chat!");
+      }
+    } else if (data === "fuse_cancel") {
+      await ctx.answerCbQuery("Fuse cancelled.");
+      await ctx.editMessageText("❌ Fuse operation cancelled.");
+    } else if (data.startsWith("fuse_confirm_card_")) {
+      await handleFuseConfirmCard(ctx);
+    } else if (data.startsWith("fuse_confirm_rarity_")) {
+      await handleFuseConfirmRarity(ctx);
     } else {
-      await ctx.answerCbQuery("Card details sent in chat!");
+      return next();
     }
   } else {
     return next();
