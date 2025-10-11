@@ -294,6 +294,58 @@ bot.command('deletecard', async (ctx) => {
     await ctx.reply(`Error deleting card: ${e.message}`, { ...getReplyParams(ctx) });
   }
 });
+
+// Command to change card rarity: /changerarity card_id (admin only)
+bot.command('changerarity', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin({ id: user.id })) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  if (!cardId) return ctx.reply('Usage: /changerarity <cardId>', { ...getReplyParams(ctx) });
+  
+  try {
+    // Check if card exists
+    const card = await prisma.card.findUnique({ where: { id: cardId } });
+    if (!card) {
+      return ctx.reply('Card not found.', { ...getReplyParams(ctx) });
+    }
+    
+    // Show rarity selection keyboard
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '🏆 Common', callback_data: `change_rarity_${cardId}_COMMON` },
+          { text: '🥈 Medium', callback_data: `change_rarity_${cardId}_MEDIUM` }
+        ],
+        [
+          { text: '🥇 Rare', callback_data: `change_rarity_${cardId}_RARE` },
+          { text: '🟡 Legendary', callback_data: `change_rarity_${cardId}_LEGENDARY` }
+        ],
+        [
+          { text: '🧠 Exclusive', callback_data: `change_rarity_${cardId}_EXCLUSIVE` },
+          { text: '🟣 Limited Edition', callback_data: `change_rarity_${cardId}_LIMITED_EDITION` }
+        ],
+        [
+          { text: '❄️ Cosmic', callback_data: `change_rarity_${cardId}_COSMIC` },
+          { text: '♠️ Prime', callback_data: `change_rarity_${cardId}_PRIME` }
+        ],
+        [
+          { text: '🧿 Premium', callback_data: `change_rarity_${cardId}_PREMIUM` }
+        ]
+      ]
+    };
+    
+    await ctx.reply(`Select new rarity for "${card.name}" (ID: ${cardId}):`, {
+      reply_markup: keyboard,
+      ...getReplyParams(ctx)
+    });
+  } catch (e: any) {
+    await ctx.reply('Failed to change rarity: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
 // Command to check card details: /check card_id
 bot.command('check', async (ctx) => {
   const parts = (ctx.message.text || '').split(/\s+/);
@@ -526,10 +578,19 @@ bot.action(/accept_gift:(.+)/, async (ctx) => {
         throw new Error('Sender no longer has this card.');
       }
 
+      // Check if this is the last card (quantity will become 0)
+      if (senderOwnership.quantity === 1) {
+        // Delete the ownership record if this is the last card
+        await tx.ownership.delete({
+          where: { id: senderOwnership.id }
+        });
+      } else {
+        // Decrement quantity if there are more cards
       await tx.ownership.update({
         where: { id: senderOwnership.id },
         data: { quantity: { decrement: 1 } }
       });
+      }
 
       // Increase recipient's quantity or create new ownership
       const recipientOwnership = await tx.ownership.findUnique({
@@ -550,6 +611,12 @@ bot.action(/accept_gift:(.+)/, async (ctx) => {
           }
         });
       }
+
+      // Increment recipient's total cards collected
+      await tx.user.update({
+        where: { id: gift.toUserId },
+        data: { totalCardsCollected: { increment: 1 } }
+      });
 
       // Remove the pending gift
       pendingGifts.delete(giftId);
@@ -789,10 +856,18 @@ bot.hears('🎁 Daily', async (ctx) => {
   await ctx.reply(`Claimed ${res.coins} coins! Balance: ${res.balance}`, { ...getReplyParams(ctx) });
 });
 
+// Command to show leaderboard: /leaderboard
+bot.command('leaderboard', async (ctx) => {
+  const top = await getLeaderboard(prisma);
+  if (top.length === 0) return ctx.reply('No players yet. Be the first!', { ...getReplyParams(ctx) });
+  const msg = top.map((u, i) => `${i + 1}. ${u.username ?? u.firstName ?? 'Anonymous'} — ${u.totalCardsCollected} cards`).join('\n');
+  await ctx.reply(`🏆 **Top 10 Card Collectors**\n\n${msg}`, { ...getReplyParams(ctx), parse_mode: 'Markdown' });
+});
+
 bot.hears('🏆 Leaderboard', async (ctx) => {
   const top = await getLeaderboard(prisma);
   if (top.length === 0) return ctx.reply('No players yet. Be the first!', { ...getReplyParams(ctx) });
-  const msg = top.map((u, i) => `${i + 1}. ${u.username ?? 'anon'} — ${u.coins} coins`).join('\n');
+  const msg = top.map((u, i) => `${i + 1}. ${u.username ?? u.firstName ?? 'Anonymous'} — ${u.totalCardsCollected} cards`).join('\n');
   await ctx.reply(msg, { ...getReplyParams(ctx) });
 });
 
@@ -1039,6 +1114,35 @@ bot.action(/reject_trade:(\d+)/, async (ctx) => {
   }
 });
 
+// Handle rarity change callback
+bot.action(/^change_rarity_(\d+)_(.+)$/, async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin({ id: user.id })) {
+    await ctx.answerCbQuery('Only admins can change card rarity.');
+    return;
+  }
+  
+  const cardId = Number(ctx.match[1]);
+  const newRarity = ctx.match[2];
+  
+  try {
+    // Update the card's rarity
+    const updatedCard = await prisma.card.update({
+      where: { id: cardId },
+      data: { rarity: newRarity }
+    });
+    
+    await ctx.editMessageText(
+      `✅ Rarity changed successfully!\n\n` +
+      `Card: ${updatedCard.name}\n` +
+      `New Rarity: ${getRarityWithEmoji(newRarity)}`
+    );
+    await ctx.answerCbQuery('Rarity changed successfully!');
+  } catch (e: any) {
+    await ctx.answerCbQuery(`Failed to change rarity: ${e.message}`);
+  }
+});
+
 bot.command('accept', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const parts = (ctx.message.text || '').split(/\s+/);
@@ -1279,7 +1383,7 @@ bot.command('help', async (ctx) => {
   const isUserAdmin = await isAdmin({ id: user.id });
   let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades';
   if (isUserAdmin) {
-    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
+    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/changerarity - Change card rarity\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
   }
   await ctx.reply(helpText);
 });
@@ -1414,20 +1518,25 @@ bot.command('profile', async (ctx) => {
   const totalCardsOwned = ownerships.reduce((sum, ownership) => sum + ownership.quantity, 0);
   const totalUniqueCards = ownerships.length;
   
-  // Calculate total cards collected (this would be the same as total cards owned currently
-  // since we don't have a separate field for cards that were traded away)
-  const totalCardsCollected = totalCardsOwned;
+  // Use the totalCardsCollected field from the user record
+  const totalCardsCollected = user.totalCardsCollected;
   
-  // Group cards by rarity
+  // Define valid rarities in order
+  const validRarities = ['COMMON', 'MEDIUM', 'RARE', 'LEGENDARY', 'LIMITED_EDITION', 'COSMIC', 'PRIME', 'PREMIUM'];
+  
+  // Group cards by rarity (only valid rarities)
   const cardsByRarity: { [key: string]: { total: number; unique: number } } = {};
   
   ownerships.forEach(ownership => {
     const rarity = ownership.card.rarity;
-    if (!cardsByRarity[rarity]) {
-      cardsByRarity[rarity] = { total: 0, unique: 0 };
+    // Only include cards with valid rarities
+    if (validRarities.includes(rarity)) {
+      if (!cardsByRarity[rarity]) {
+        cardsByRarity[rarity] = { total: 0, unique: 0 };
+      }
+      cardsByRarity[rarity].total += ownership.quantity;
+      cardsByRarity[rarity].unique += 1;
     }
-    cardsByRarity[rarity].total += ownership.quantity;
-    cardsByRarity[rarity].unique += 1;
   });
   
   // Build profile message
@@ -1440,21 +1549,18 @@ bot.command('profile', async (ctx) => {
   profileMessage += `<b>Total Coins:</b> ${user.coins}\n\n`;
   
   // Add rarity breakdown
-  if (Object.keys(cardsByRarity).length > 0) {
-    profileMessage += `<b>📊 Cards by Rarity:</b>\n`;
-    Object.entries(cardsByRarity)
-      .sort(([a], [b]) => {
-        // Sort by rarity order (you can customize this order)
-        const rarityOrder = ['COMMON', 'MEDIUM', 'RARE', 'LEGENDARY', 'EXCLUSIVE', 'LIMITED_EDITION', 'COSMIC', 'PRIME', 'PREMIUM'];
-        return rarityOrder.indexOf(a) - rarityOrder.indexOf(b);
-      })
-      .forEach(([rarity, stats]) => {
-        const emoji = RARITY_EMOJIS[rarity] || '⭐';
-        profileMessage += `${emoji} ${rarity}: ${stats.total} cards (${stats.unique} unique)\n`;
-      });
-  } else {
-    profileMessage += `<b>📊 Cards by Rarity:</b>\nNo cards owned yet.`;
-  }
+  profileMessage += `<b>📊 Cards by Rarity:</b>\n`;
+  // Show all rarities in the specified order, even if not owned
+  validRarities.forEach(rarity => {
+    const emoji = RARITY_EMOJIS[rarity] || '⭐';
+    if (cardsByRarity[rarity]) {
+      const stats = cardsByRarity[rarity];
+      profileMessage += `${emoji} ${rarity}: ${stats.total}(${stats.unique})\n`;
+    } else {
+      // Show 0(0) for rarities not owned
+      profileMessage += `${emoji} ${rarity}: 0(0)\n`;
+    }
+  });
   
   await ctx.replyWithHTML(profileMessage, { ...getReplyParams(ctx) });
 });
@@ -2088,19 +2194,19 @@ bot.on("callback_query", async (ctx, next) => {
     const data = ctx.callbackQuery.data;
     
     if (data === "check_card") {
-      const userId = ctx.callbackQuery.from.id;
-      let cardFound = false;
-      // Iterate over active card drops to find an uncollected card
-      for (const [chatId, card] of activeCardDrops.entries()) {
-        if (!card.collected) {
-          cardFound = await sendCardDetails(ctx, card, chatId);
-          break;
-        }
+    const userId = ctx.callbackQuery.from.id;
+    let cardFound = false;
+    // Iterate over active card drops to find an uncollected card
+    for (const [chatId, card] of activeCardDrops.entries()) {
+      if (!card.collected) {
+        cardFound = await sendCardDetails(ctx, card, chatId);
+        break;
       }
-      if (!cardFound) {
-        await ctx.answerCbQuery("No active card drop available.");
-      } else {
-        await ctx.answerCbQuery("Card details sent in chat!");
+    }
+    if (!cardFound) {
+      await ctx.answerCbQuery("No active card drop available.");
+    } else {
+      await ctx.answerCbQuery("Card details sent in chat!");
       }
     } else if (data === "fuse_cancel") {
       await ctx.answerCbQuery("Fuse cancelled.");
@@ -2139,8 +2245,10 @@ bot.on("text", async (ctx, next) => {
         // Add card to user's collection
         const user = await ensureUser(prisma, ctx.from);
         try {
+          // Use transaction to ensure atomicity
+          await prisma.$transaction(async (tx) => {
           // Check if user already has this card
-          const existing = await prisma.ownership.findUnique({
+            const existing = await tx.ownership.findUnique({
             where: {
               userId_cardId: {
                 userId: user.id,
@@ -2151,13 +2259,13 @@ bot.on("text", async (ctx, next) => {
 
           if (existing) {
             // Increment quantity if user already has the card
-            await prisma.ownership.update({
+              await tx.ownership.update({
               where: { id: existing.id },
               data: { quantity: existing.quantity + 1 }
             });
           } else {
             // Create new ownership if user doesn't have the card
-            await prisma.ownership.create({
+              await tx.ownership.create({
               data: {
                 userId: user.id,
                 cardId: activeCard.id,
@@ -2165,6 +2273,13 @@ bot.on("text", async (ctx, next) => {
               }
             });
           }
+
+            // Increment totalCardsCollected for the user
+            await tx.user.update({
+              where: { id: user.id },
+              data: { totalCardsCollected: { increment: 1 } }
+            });
+          });
 
           activeCard.collected = true;
           activeCardDrops.set(chatId, activeCard);

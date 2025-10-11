@@ -45,7 +45,13 @@ export async function openPackForUser(prisma, userId) {
     if (!chosen)
         throw new Error('No cards in catalog yet. Seed the database.');
     const updated = await prisma.$transaction(async (tx) => {
-        await tx.user.update({ where: { id: user.id }, data: { lastPackAt: new Date() } });
+        await tx.user.update({
+            where: { id: user.id },
+            data: {
+                lastPackAt: new Date(),
+                totalCardsCollected: { increment: 1 }
+            }
+        });
         const existing = await tx.ownership.findUnique({ where: { userId_cardId: { userId: user.id, cardId: chosen.id } } });
         if (existing) {
             await tx.ownership.update({ where: { id: existing.id }, data: { quantity: { increment: 1 } } });
@@ -71,6 +77,6 @@ export async function claimDaily(prisma, userId) {
     return { ok: true, coins: reward, balance: u.coins };
 }
 export async function getLeaderboard(prisma) {
-    return prisma.user.findMany({ orderBy: { coins: 'desc' }, take: 10 });
+    return prisma.user.findMany({ orderBy: { totalCardsCollected: 'desc' }, take: 10 });
 }
 //# sourceMappingURL=game.js.map

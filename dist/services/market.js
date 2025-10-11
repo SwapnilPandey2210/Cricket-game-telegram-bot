@@ -9,7 +9,15 @@ export async function listForSale(prisma, userId, cardId, quantity, price) {
     if (existing)
         throw new Error('You already have an active listing for this card at this price.');
     return prisma.$transaction(async (tx) => {
-        await tx.ownership.update({ where: { id: own.id }, data: { quantity: { decrement: quantity } } });
+        // Check if this will remove all cards (quantity becomes 0)
+        if (own.quantity === quantity) {
+            // Delete the ownership record if all cards are being listed
+            await tx.ownership.delete({ where: { id: own.id } });
+        }
+        else {
+            // Decrement quantity if there are remaining cards
+            await tx.ownership.update({ where: { id: own.id }, data: { quantity: { decrement: quantity } } });
+        }
         const listing = await tx.listing.create({ data: { sellerId: userId, cardId, quantity, price, active: true } });
         return listing;
     });
@@ -42,6 +50,8 @@ export async function buyFromMarket(prisma, buyerId, listingId, quantity) {
         else {
             await tx.ownership.create({ data: { userId: buyerId, cardId: listing.cardId, quantity } });
         }
+        // Increment buyer's total cards collected
+        await tx.user.update({ where: { id: buyerId }, data: { totalCardsCollected: { increment: quantity } } });
         return { ok: true, spent: total, listingId: listing.id };
     });
 }

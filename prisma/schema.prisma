@@ -17,6 +17,8 @@ model User {
   coins          Int       @default(100)
   lastDailyAt    DateTime?
   lastPackAt    DateTime?
+  isAdmin       Boolean    @default(false)
+  totalCardsCollected Int @default(0)
   ownedCards     Ownership[]
   tradesSent     Trade[]   @relation("trades_sent")
   tradesReceived Trade[]   @relation("trades_received")
@@ -26,12 +28,10 @@ model User {
 
 model Card {
   id          Int         @id @default(autoincrement())
-  slug        String      @unique
   name        String
   rarity      String      @default("COMMON")
   country     String
   role        String
-  rating      Int
   bio         String?
   imageUrl    String?
   createdAt   DateTime    @default(now())

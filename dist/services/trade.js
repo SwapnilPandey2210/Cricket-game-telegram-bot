@@ -1,4 +1,4 @@
-export async function createTrade(prisma, fromUserId, toUserId, offeredCardId, requestedCardId) {
+export const createTrade = async (prisma, fromUserId, toUserId, offeredCardId, requestedCardId) => {
     if (fromUserId === toUserId)
         throw new Error('Cannot trade with yourself.');
     const hasOffered = await prisma.ownership.findUnique({ where: { userId_cardId: { userId: fromUserId, cardId: offeredCardId } } });
@@ -8,8 +8,8 @@ export async function createTrade(prisma, fromUserId, toUserId, offeredCardId, r
     if (!hasRequested || hasRequested.quantity <= 0)
         throw new Error('Target user does not own the requested card.');
     return prisma.trade.create({ data: { fromUserId, toUserId, offeredCardId, requestedCardId, status: 'PENDING' } });
-}
-export async function acceptTrade(prisma, tradeId, actingUserId) {
+};
+export const acceptTrade = async (prisma, tradeId, actingUserId) => {
     return prisma.$transaction(async (tx) => {
         const trade = await tx.trade.findUnique({ where: { id: tradeId } });
         if (!trade || trade.status !== 'PENDING')
@@ -22,8 +22,20 @@ export async function acceptTrade(prisma, tradeId, actingUserId) {
             throw new Error('Sender no longer owns offered card.');
         if (!toOwn || toOwn.quantity <= 0)
             throw new Error('Recipient no longer owns requested card.');
-        await tx.ownership.update({ where: { id: fromOwn.id }, data: { quantity: { decrement: 1 } } });
-        await tx.ownership.update({ where: { id: toOwn.id }, data: { quantity: { decrement: 1 } } });
+        // Handle fromOwn quantity - delete if becomes 0, otherwise decrement
+        if (fromOwn.quantity === 1) {
+            await tx.ownership.delete({ where: { id: fromOwn.id } });
+        }
+        else {
+            await tx.ownership.update({ where: { id: fromOwn.id }, data: { quantity: { decrement: 1 } } });
+        }
+        // Handle toOwn quantity - delete if becomes 0, otherwise decrement
+        if (toOwn.quantity === 1) {
+            await tx.ownership.delete({ where: { id: toOwn.id } });
+        }
+        else {
+            await tx.ownership.update({ where: { id: toOwn.id }, data: { quantity: { decrement: 1 } } });
+        }
         const toHasOffered = await tx.ownership.findUnique({ where: { userId_cardId: { userId: trade.toUserId, cardId: trade.offeredCardId } } });
         if (toHasOffered) {
             await tx.ownership.update({ where: { id: toHasOffered.id }, data: { quantity: { increment: 1 } } });
@@ -38,11 +50,14 @@ export async function acceptTrade(prisma, tradeId, actingUserId) {
         else {
             await tx.ownership.create({ data: { userId: trade.fromUserId, cardId: trade.requestedCardId, quantity: 1 } });
         }
+        // Increment total cards collected for both users
+        await tx.user.update({ where: { id: trade.toUserId }, data: { totalCardsCollected: { increment: 1 } } });
+        await tx.user.update({ where: { id: trade.fromUserId }, data: { totalCardsCollected: { increment: 1 } } });
         await tx.trade.update({ where: { id: trade.id }, data: { status: 'ACCEPTED' } });
         return { ok: true };
     });
-}
-export async function rejectTrade(prisma, tradeId, actingUserId) {
+};
+export const rejectTrade = async (prisma, tradeId, actingUserId) => {
     const trade = await prisma.trade.findUnique({ where: { id: tradeId } });
     if (!trade || trade.status !== 'PENDING')
         throw new Error('Trade not available.');
@@ -50,8 +65,8 @@ export async function rejectTrade(prisma, tradeId, actingUserId) {
         throw new Error('Only recipient can reject.');
     await prisma.trade.update({ where: { id: trade.id }, data: { status: 'REJECTED' } });
     return { ok: true };
-}
-export async function myTrades(prisma, userId) {
+};
+export const myTrades = async (prisma, userId) => {
     return prisma.trade.findMany({ where: { OR: [{ fromUserId: userId }, { toUserId: userId }] }, orderBy: { createdAt: 'desc' } });
-}
+};
 //# sourceMappingURL=trade.js.map
