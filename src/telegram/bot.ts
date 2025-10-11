@@ -346,6 +346,81 @@ bot.command('changerarity', async (ctx) => {
   }
 });
 
+// Command to give card to user: /daan card_id (admin only, must reply to user's message)
+bot.command('daan', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin({ id: admin.id })) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
+  
+  // Check if this is a reply to another user's message
+  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.from) {
+    return ctx.reply('Please reply to a user\'s message to give them a card.', { ...getReplyParams(ctx) });
+  }
+  
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  if (!cardId) return ctx.reply('Usage: /daan <cardId> (reply to user\'s message)', { ...getReplyParams(ctx) });
+  
+  try {
+    // Check if card exists
+    const card = await prisma.card.findUnique({ where: { id: cardId } });
+    if (!card) {
+      return ctx.reply('Card not found.', { ...getReplyParams(ctx) });
+    }
+    
+    // Get the target user (the one being replied to)
+    const targetUser = await ensureUser(prisma, ctx.message.reply_to_message.from);
+    
+    // Use transaction to give the card and update totalCardsCollected
+    await prisma.$transaction(async (tx) => {
+      // Check if user already has this card
+      const existing = await tx.ownership.findUnique({
+        where: {
+          userId_cardId: {
+            userId: targetUser.id,
+            cardId: cardId
+          }
+        }
+      });
+
+      if (existing) {
+        // Increment quantity if user already has the card
+        await tx.ownership.update({
+          where: { id: existing.id },
+          data: { quantity: existing.quantity + 1 }
+        });
+      } else {
+        // Create new ownership if user doesn't have the card
+        await tx.ownership.create({
+          data: {
+            userId: targetUser.id,
+            cardId: cardId,
+            quantity: 1
+          }
+        });
+      }
+
+      // Increment totalCardsCollected for the target user
+      await tx.user.update({
+        where: { id: targetUser.id },
+        data: { totalCardsCollected: { increment: 1 } }
+      });
+    });
+    
+    const targetUserName = targetUser.firstName || targetUser.username || 'User';
+    await ctx.reply(
+      `✅ Card given successfully!\n\n` +
+      `Given to: ${targetUserName}\n` +
+      `Card: ${getRarityWithEmoji(card.rarity)} ${card.name}\n` +
+      `Card ID: ${cardId}`,
+      { ...getReplyParams(ctx) }
+    );
+  } catch (e: any) {
+    await ctx.reply('Failed to give card: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
 // Command to check card details: /check card_id
 bot.command('check', async (ctx) => {
   const parts = (ctx.message.text || '').split(/\s+/);
@@ -490,13 +565,13 @@ bot.hears('📇 My Cards', async (ctx) => {
   
   const message = `📇 Your Cards (Page ${currentPage + 1}/${totalPages}):\n\n${cardsList}`;
   
-  // Create navigation buttons
+  // Create navigation buttons with user ID
   const buttons = [];
   if (currentPage > 0) {
-    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+    buttons.push({ text: '⬅️ Previous', callback_data: `cards:prev:${userId}` });
   }
   if (currentPage < totalPages - 1) {
-    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+    buttons.push({ text: 'Next ➡️', callback_data: `cards:next:${userId}` });
   }
   
   await ctx.reply(message, {
@@ -509,10 +584,18 @@ bot.hears('📇 My Cards', async (ctx) => {
 });
 
 // Handle cards pagination
-bot.action('cards:next', async (ctx) => {
-  const userId = ctx.from.id;
-  const currentPage = userCardPages.get(userId) || 0;
-  userCardPages.set(userId, currentPage + 1);
+bot.action(/^cards:next:(\d+)$/, async (ctx) => {
+  const originalUserId = Number(ctx.match[1]);
+  const clickingUserId = ctx.from.id;
+  
+  // Only allow the original user to control pagination
+  if (originalUserId !== clickingUserId) {
+    await ctx.answerCbQuery('Only the card owner can navigate their cards.');
+    return;
+  }
+  
+  const currentPage = userCardPages.get(originalUserId) || 0;
+  userCardPages.set(originalUserId, currentPage + 1);
   
   // Re-display cards with new page
   const user = await ensureUser(prisma, ctx.from);
@@ -533,10 +616,10 @@ bot.action('cards:next', async (ctx) => {
   // Update navigation buttons
   const buttons = [];
   if (currentPage + 1 > 0) {
-    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+    buttons.push({ text: '⬅️ Previous', callback_data: `cards:prev:${originalUserId}` });
   }
   if (currentPage + 1 < totalPages - 1) {
-    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+    buttons.push({ text: 'Next ➡️', callback_data: `cards:next:${originalUserId}` });
   }
   
   await ctx.editMessageText(message, {
@@ -701,7 +784,16 @@ bot.action(/^cards_rarity:(.+)$/, async (ctx) => {
   await ctx.editMessageText(message, { parse_mode: 'HTML' });
 });
 
-bot.action('cards:prev', async (ctx) => {
+bot.action(/^cards:prev:(\d+)$/, async (ctx) => {
+  const originalUserId = Number(ctx.match[1]);
+  const clickingUserId = ctx.from.id;
+  
+  // Only allow the original user to control pagination
+  if (originalUserId !== clickingUserId) {
+    await ctx.answerCbQuery('Only the card owner can navigate their cards.');
+    return;
+  }
+  
   const userId = ctx.from.id;
   const currentPage = userCardPages.get(userId) || 0;
   userCardPages.set(userId, currentPage - 1);
@@ -725,10 +817,10 @@ bot.action('cards:prev', async (ctx) => {
   // Update navigation buttons
   const buttons = [];
   if (currentPage - 1 > 0) {
-    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+    buttons.push({ text: '⬅️ Previous', callback_data: `cards:prev:${originalUserId}` });
   }
   if (currentPage - 1 < totalPages - 1) {
-    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+    buttons.push({ text: 'Next ➡️', callback_data: `cards:next:${originalUserId}` });
   }
   
   await ctx.editMessageText(message, {
@@ -831,13 +923,13 @@ bot.command('cards', async (ctx) => {
   
   const message = `📇 Your Cards (Page ${currentPage + 1}/${totalPages}):\n\n${cardsList}`;
   
-  // Create navigation buttons
+  // Create navigation buttons with user ID
   const buttons = [];
   if (currentPage > 0) {
-    buttons.push({ text: '⬅️ Previous', callback_data: 'cards:prev' });
+    buttons.push({ text: '⬅️ Previous', callback_data: `cards:prev:${userId}` });
   }
   if (currentPage < totalPages - 1) {
-    buttons.push({ text: 'Next ➡️', callback_data: 'cards:next' });
+    buttons.push({ text: 'Next ➡️', callback_data: `cards:next:${userId}` });
   }
   
   await ctx.reply(message, {
@@ -1383,7 +1475,7 @@ bot.command('help', async (ctx) => {
   const isUserAdmin = await isAdmin({ id: user.id });
   let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades';
   if (isUserAdmin) {
-    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/changerarity - Change card rarity\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
+    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/changerarity - Change card rarity\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
   }
   await ctx.reply(helpText);
 });
