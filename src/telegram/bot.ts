@@ -2,6 +2,7 @@ import { Telegraf, Markup, Scenes, session } from 'telegraf';
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
+import dayjs from 'dayjs';
 type MyWizardContext = Scenes.WizardContext;
 import { PrismaClient } from '@prisma/client';
 import { ensureUser, openPackForUser, listUserCards, claimDaily, getLeaderboard } from '../services/game.js';
@@ -26,15 +27,69 @@ export { bot, prisma }
 
 // Do not need separate action handlers as we'll handle them in the wizard
 
+// Helper function to get a sticker from CricketBotOfficialS pack
+async function getCricketSticker(ctx: any): Promise<string> {
+  let stickerFileId = 'CAACAgUAAxkBAAILWGShUkG9AAGnyI0uD3E53QftAAHKiwACfgQAAu_wsVYVB_CQPipbkDME'; // fallback sticker
+  
+  try {
+    const stickerSet = await ctx.telegram.getStickerSet('CricketBotOfficialS');
+    if (stickerSet.stickers && stickerSet.stickers.length > 0) {
+      // Use the first sticker from the pack (you can modify this to select a specific one or random)
+      stickerFileId = stickerSet.stickers[0].file_id;
+    }
+  } catch (error) {
+    console.log('Could not fetch CricketBotOfficialS stickers, using fallback:', error);
+  }
+  
+  return stickerFileId;
+}
+
+// Helper function to check if user can open a pack (cooldown check)
+async function canOpenPack(prisma: PrismaClient, userId: number): Promise<{ canOpen: boolean; message?: string }> {
+  const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  const now = dayjs();
+  if (user.lastPackAt && dayjs(user.lastPackAt).isAfter(now.subtract(3, 'minute'))) {
+    const next = dayjs(user.lastPackAt).add(3, 'minute');
+    const seconds = Math.max(1, Math.ceil(next.diff(now) / 1000));
+    return { canOpen: false, message: `Pack on cooldown. Try again in ${seconds} seconds.` };
+  }
+  return { canOpen: true };
+}
+
 // Command handlers that work in both private and group chats
 bot.command('openpack', async (ctx) => {
   try {
     const user = await ensureUser(prisma, ctx.from);
+    
+    // Check if user can open a pack (cooldown check)
+    const cooldownCheck = await canOpenPack(prisma, user.id);
+    if (!cooldownCheck.canOpen) {
+      await ctx.reply(cooldownCheck.message!, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Get sticker from CricketBotOfficialS pack
+    const stickerFileId = await getCricketSticker(ctx);
+    
+    // Send cricket sticker for pack opening
+    const stickerMessage = await ctx.replyWithSticker(stickerFileId, { ...getReplyParams(ctx) });
+    
+    // Get the pack results while the sticker is showing
     const results = await openPackForUser(prisma, user.id);
-    // Format each card with the new template
+    
+    // Wait for 2 seconds to show the animation
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Delete the sticker message
+    await ctx.telegram.deleteMessage(ctx.chat.id, stickerMessage.message_id);
+    
+    // Display each card with image and username message combined
     for (const result of results) {
-      const message = `✪ You Collected A ${result.card.rarity} !!\n\n${result.card.name}\n➥ ${result.card.country}\n\nTake A Look At Your Collection Using /cards`;
-      await ctx.reply(message, { ...getReplyParams(ctx) });
+      const playerName = ctx.from.first_name || ctx.from.username || 'Player';
+      const prefix = `${playerName} got a new card.`;
+      
+      // Send the card with image and username message combined
+      await sendCardDetails(ctx, result.card, undefined, prefix);
     }
   } catch (e: any) {
     const msg = e && e.message ? e.message : 'Failed to open pack.';
@@ -325,8 +380,36 @@ function listingActions(listingId: number) {
 bot.hears('🃏 Open Pack', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   try {
+    // Check if user can open a pack (cooldown check)
+    const cooldownCheck = await canOpenPack(prisma, user.id);
+    if (!cooldownCheck.canOpen) {
+      await ctx.reply(cooldownCheck.message!, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Get sticker from CricketBotOfficialS pack
+    const stickerFileId = await getCricketSticker(ctx);
+    
+    // Send cricket sticker for pack opening
+    const stickerMessage = await ctx.replyWithSticker(stickerFileId, { ...getReplyParams(ctx) });
+    
+    // Get the pack results while the sticker is showing
     const results = await openPackForUser(prisma, user.id);
-    await ctx.reply('You opened a pack and pulled:\n' + results.map(r => '- ' + r.card.name + ' (' + r.card.rarity + ')').join('\n'), { ...getReplyParams(ctx) });
+    
+    // Wait for 2 seconds to show the animation
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Delete the sticker message
+    await ctx.telegram.deleteMessage(ctx.chat.id, stickerMessage.message_id);
+    
+    // Display each card with image and username message combined
+    for (const result of results) {
+      const playerName = ctx.from.first_name || ctx.from.username || 'Player';
+      const prefix = `${playerName} got a new card.`;
+      
+      // Send the card with image and username message combined
+      await sendCardDetails(ctx, result.card, undefined, prefix);
+    }
   } catch (e: any) {
     const msg = e && e.message ? e.message : 'Failed to open pack.';
     await ctx.reply(msg, { ...getReplyParams(ctx) });
@@ -1309,24 +1392,11 @@ bot.command('removeadmin', async (ctx) => {
   }
 });
 
-bot.command('pack', async (ctx) => {
-  const user = await ensureUser(prisma, ctx.from);
-  try {
-    const results = await openPackForUser(prisma, user.id);
-    for (const result of results) {
-      const cardDetails = `<b>You opened a new card!</b>\n<b>Card ID:</b> ${result.card.id}\n<b>Name:</b> ${result.card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(result.card.rarity)}\n<b>Country:</b> ${result.card.country}\n<b>Role:</b> ${result.card.role}${(result.card as any).bio ? `\n<b>Bio:</b> ${(result.card as any).bio}` : ''}`;
-      await ctx.replyWithHTML(cardDetails, { ...getReplyParams(ctx) });
-    }
-  } catch (e: any) {
-    const msg = e && e.message ? e.message : 'Failed to open pack.';
-    await ctx.reply(msg, { ...getReplyParams(ctx) });
-  }
-});
 
 bot.command('cards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const cards = await listUserCards(prisma, user.id);
-  if (cards.length === 0) return ctx.reply('You have no cards yet. Try /pack', { ...getReplyParams(ctx) });
+  if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!', { ...getReplyParams(ctx) });
   const cardsList = cards.map(c => `<b>Card ID:</b> ${c.cardId}\n<b>Name:</b> ${c.card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(c.card.rarity)}\n<b>Country:</b> ${c.card.country}\n<b>Role:</b> ${c.card.role}\n<b>Quantity:</b> x${c.quantity}`).join('\n\n');
   await ctx.replyWithHTML(cardsList, { ...getReplyParams(ctx) });
 });
@@ -1586,7 +1656,7 @@ function isValidImageUrl(url: string): boolean {
 }
 
 // Helper function to send card details with image
-async function sendCardDetails(ctx: any, card: any, chatId?: number) {
+async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: string) {
   // Always use ctx.telegram.sendPhoto for sending images, to avoid argument confusion
 
   // Debug log to verify arguments
@@ -1599,7 +1669,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
   if (typeof card.imageUrl !== 'string' || !card.imageUrl.startsWith('http')) {
     console.error('Invalid imageUrl:', card.imageUrl);
     // Fallback: If no image or image sending failed, send text-only message
-    const cardDetails = `<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+    const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
     await ctx.telegram.sendMessage(
       chatId || ctx.chat.id,
       cardDetails,
@@ -1609,7 +1679,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
   }
 
   try {
-    const cardDetails = `<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+    const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
     console.log('Calling sendPhoto with:', chatId || ctx.chat.id, card.imageUrl);
     await ctx.telegram.sendPhoto(
       chatId || ctx.chat.id,
@@ -1628,7 +1698,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
     try {
       const response = await axios.get(card.imageUrl, { responseType: 'arraybuffer' });
       const buffer = Buffer.from(response.data, 'binary');
-      const cardDetails = `<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+      const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
       try {
         await ctx.telegram.sendPhoto(
           chatId || ctx.chat.id,
@@ -1667,7 +1737,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number) {
   }
 
   // Fallback: If image sending failed, send text-only message
-  const cardDetails = `<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+  const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
   await ctx.telegram.sendMessage(
     chatId || ctx.chat.id,
     cardDetails,
