@@ -1473,7 +1473,7 @@ bot.command('gift', async (ctx) => {
 bot.command('help', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const isUserAdmin = await isAdmin({ id: user.id });
-  let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades';
+  let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck';
   if (isUserAdmin) {
     helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/changerarity - Change card rarity\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
   }
@@ -1674,7 +1674,7 @@ bot.command('fuse', async (ctx) => {
   const parts = (ctx.message.text || '').split(/\s+/);
   
   if (parts.length < 2) {
-    await ctx.reply('Usage: /fuse <card_id> or /fuse <rarity>\n\nExamples:\n/fuse 123 - Fuse all cards of card ID 123\n/fuse legendary - Fuse all legendary cards', { ...getReplyParams(ctx) });
+    await ctx.reply('Usage: /fuse &lt;card_id&gt; or /fuse &lt;rarity&gt;\n\nExamples:\n/fuse 123 - Fuse all cards of card ID 123\n/fuse legendary - Fuse all legendary cards', { ...getReplyParams(ctx), parse_mode: 'HTML' });
     return;
   }
   
@@ -1707,6 +1707,27 @@ async function handleFuseCardById(ctx: any, user: any, cardId: number) {
     
     if (!ownership) {
       await ctx.reply(`You don't own any cards with ID ${cardId}.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Check if card is locked from fusing
+    const fuseLock = await prisma.fuseLock.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      }
+    });
+    
+    if (fuseLock) {
+      await ctx.reply(
+        `🔒 **Card is Locked from Fusing**\n\n` +
+        `Card: ${getRarityWithEmoji(ownership.card.rarity)} ${ownership.card.name}\n` +
+        `Card ID: ${cardId}\n\n` +
+        `This card is protected from fusing. Use /fuseunlock ${cardId} to unlock it.`,
+        { ...getReplyParams(ctx), parse_mode: 'HTML' }
+      );
       return;
     }
     
@@ -1767,10 +1788,19 @@ async function handleFuseByRarity(ctx: any, user: any, rarityInput: string) {
       include: { card: true }
     });
     
-    const cardsOfRarity = ownerships.filter(ownership => ownership.card.rarity === rarity);
+    // Get all fuse locks for this user
+    const fuseLocks = await prisma.fuseLock.findMany({
+      where: { userId: user.id }
+    });
+    const lockedCardIds = new Set(fuseLocks.map(lock => lock.cardId));
+    
+    // Filter cards of this rarity, excluding locked ones
+    const cardsOfRarity = ownerships.filter(ownership => 
+      ownership.card.rarity === rarity && !lockedCardIds.has(ownership.cardId)
+    );
     
     if (cardsOfRarity.length === 0) {
-      await ctx.reply(`You don't own any ${rarity} cards.`, { ...getReplyParams(ctx) });
+      await ctx.reply(`You don't own any ${rarity} cards that can be fused (some may be locked).`, { ...getReplyParams(ctx) });
       return;
     }
     
@@ -2260,6 +2290,28 @@ async function handleFuseConfirmCard(ctx: any) {
       return;
     }
     
+    // Check if card is locked from fusing
+    const fuseLock = await prisma.fuseLock.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      }
+    });
+    
+    if (fuseLock) {
+      await ctx.answerCbQuery("Card is locked from fusing.");
+      await ctx.editMessageText(
+        `🔒 **Card is Locked from Fusing**\n\n` +
+        `Card: ${getRarityWithEmoji(ownership.card.rarity)} ${ownership.card.name}\n` +
+        `Card ID: ${cardId}\n\n` +
+        `This card is protected from fusing. Use /fuseunlock ${cardId} to unlock it.`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+    
     const card = ownership.card;
     const quantity = ownership.quantity;
     const rarity = card.rarity;
@@ -2316,7 +2368,16 @@ async function handleFuseConfirmRarity(ctx: any) {
       include: { card: true }
     });
     
-    const cardsOfRarity = ownerships.filter(ownership => ownership.card.rarity === rarity);
+    // Get all fuse locks for this user
+    const fuseLocks = await prisma.fuseLock.findMany({
+      where: { userId: user.id }
+    });
+    const lockedCardIds = new Set(fuseLocks.map(lock => lock.cardId));
+    
+    // Filter cards of this rarity, excluding locked ones
+    const cardsOfRarity = ownerships.filter(ownership => 
+      ownership.card.rarity === rarity && !lockedCardIds.has(ownership.cardId)
+    );
     
     if (cardsOfRarity.length === 0) {
       await ctx.answerCbQuery("No cards of this rarity found.");
@@ -2364,6 +2425,161 @@ async function handleFuseConfirmRarity(ctx: any) {
     await ctx.editMessageText("❌ An error occurred during fusion.");
   }
 }
+
+// Fuse lock command: /fuselock card_id
+bot.command('fuselock', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  
+  if (!cardId) {
+    await ctx.reply('Usage: /fuselock &lt;card_id&gt;\n\nExample: /fuselock 123', { ...getReplyParams(ctx), parse_mode: 'HTML' });
+    return;
+  }
+  
+  try {
+    // Check if user owns this card
+    const ownership = await prisma.ownership.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      },
+      include: { card: true }
+    });
+    
+    if (!ownership) {
+      await ctx.reply(`You don't own any cards with ID ${cardId}.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Check if card is already locked
+    const existingLock = await prisma.fuseLock.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      }
+    });
+    
+    if (existingLock) {
+      await ctx.reply(`Card "${ownership.card.name}" (ID: ${cardId}) is already locked from fusing.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Create fuse lock
+    await prisma.fuseLock.create({
+      data: {
+        userId: user.id,
+        cardId: cardId
+      }
+    });
+    
+    await ctx.reply(
+      `🔒 **Card Locked from Fusing**\n\n` +
+      `Card: ${getRarityWithEmoji(ownership.card.rarity)} ${ownership.card.name}\n` +
+      `Card ID: ${cardId}\n\n` +
+      `This card will not be affected by /fuse commands.`,
+      { ...getReplyParams(ctx), parse_mode: 'HTML' }
+    );
+    
+  } catch (e: any) {
+    await ctx.reply('Failed to lock card: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
+// Fuse unlock command: /fuseunlock card_id
+bot.command('fuseunlock', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  
+  if (!cardId) {
+    await ctx.reply('Usage: /fuseunlock &lt;card_id&gt;\n\nExample: /fuseunlock 123', { ...getReplyParams(ctx), parse_mode: 'HTML' });
+    return;
+  }
+  
+  try {
+    // Check if fuse lock exists
+    const fuseLock = await prisma.fuseLock.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      },
+      include: { card: true }
+    });
+    
+    if (!fuseLock) {
+      await ctx.reply(`Card ID ${cardId} is not locked from fusing.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Remove fuse lock
+    await prisma.fuseLock.delete({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      }
+    });
+    
+    await ctx.reply(
+      `🔓 **Card Unlocked from Fusing**\n\n` +
+      `Card: ${getRarityWithEmoji(fuseLock.card.rarity)} ${fuseLock.card.name}\n` +
+      `Card ID: ${cardId}\n\n` +
+      `This card can now be fused again.`,
+      { ...getReplyParams(ctx), parse_mode: 'HTML' }
+    );
+    
+  } catch (e: any) {
+    await ctx.reply('Failed to unlock card: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
+// Fuse check command: /fusecheck
+bot.command('fusecheck', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  
+  try {
+    // Get all fuse locks for this user
+    const fuseLocks = await prisma.fuseLock.findMany({
+      where: { userId: user.id },
+      include: { card: true },
+      orderBy: { createdAt: 'desc' }
+    });
+    
+    if (fuseLocks.length === 0) {
+      await ctx.reply(
+        `🔒 **Fuse Lock Status**\n\n` +
+        `No cards are currently locked from fusing.\n\n` +
+        `Use /fuselock &lt;card_id&gt; to lock a card from being fused.`,
+        { ...getReplyParams(ctx), parse_mode: 'HTML' }
+      );
+      return;
+    }
+    
+    let message = `🔒 **Fuse Lock Status**\n\n`;
+    message += `You have ${fuseLocks.length} card(s) locked from fusing:\n\n`;
+    
+    fuseLocks.forEach((lock, index) => {
+      const card = lock.card;
+      message += `${index + 1}. ${getRarityWithEmoji(card.rarity)} **${card.name}** (ID: ${card.id})\n`;
+    });
+    
+    message += `\n━━━━━━━━━━━━━━━━━━\n`;
+    message += `Use /fuseunlock &lt;card_id&gt; to unlock a card.`;
+    
+    await ctx.reply(message, { ...getReplyParams(ctx), parse_mode: 'HTML' });
+    
+  } catch (e: any) {
+    await ctx.reply('Failed to check fuse locks: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
 
 // Handler for Top Collectors button
 async function handleTopCollectors(ctx: any) {
