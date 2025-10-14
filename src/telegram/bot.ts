@@ -1473,7 +1473,7 @@ bot.command('gift', async (ctx) => {
 bot.command('help', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const isUserAdmin = await isAdmin({ id: user.id });
-  let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck';
+  let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
   if (isUserAdmin) {
     helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/changerarity - Change card rarity\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
   }
@@ -1593,7 +1593,9 @@ bot.command('cards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const cards = await listUserCards(prisma, user.id);
   if (cards.length === 0) return ctx.reply('You have no cards yet. Try opening a pack!', { ...getReplyParams(ctx) });
+  
   const cardsList = cards.map(c => `<b>Card ID:</b> ${c.cardId}\n<b>Name:</b> ${c.card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(c.card.rarity)}\n<b>Country:</b> ${c.card.country}\n<b>Role:</b> ${c.card.role}\n<b>Quantity:</b> x${c.quantity}`).join('\n\n');
+  
   await ctx.replyWithHTML(cardsList, { ...getReplyParams(ctx) });
 });
 
@@ -1665,7 +1667,27 @@ bot.command('profile', async (ctx) => {
   profileMessage += `━━━━━━━━━━━━━━━━━━\n\n`;
   profileMessage += `🏟️ Keep collecting to climb the leaderboard!`;
   
-  await ctx.replyWithHTML(profileMessage, { ...getReplyParams(ctx) });
+  // Get favorite card if set
+  let favoriteCard = null;
+  if (user.favoriteCardId) {
+    favoriteCard = await prisma.card.findUnique({
+      where: { id: user.favoriteCardId }
+    });
+  }
+  
+  // If user has a favorite card with image, send it with the profile
+  if (favoriteCard && favoriteCard.imageUrl && favoriteCard.imageUrl.startsWith('http')) {
+    await ctx.replyWithPhoto(
+      favoriteCard.imageUrl,
+      {
+        caption: profileMessage,
+        parse_mode: 'HTML',
+        ...getReplyParams(ctx)
+      }
+    );
+  } else {
+    await ctx.replyWithHTML(profileMessage, { ...getReplyParams(ctx) });
+  }
 });
 
 // Fuse command: /fuse card_id or /fuse rarity
@@ -2581,6 +2603,110 @@ bot.command('fusecheck', async (ctx) => {
   }
 });
 
+// Favorite card command: /fav card_id
+bot.command('fav', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  const parts = (ctx.message.text || '').split(/\s+/);
+  
+  if (parts.length === 1) {
+    // Show current favorite card
+    if (!user.favoriteCardId) {
+      await ctx.reply(
+        `⭐ ━━━〔 FAVORITE CARD 〕━━━ ⭐\n\n` +
+        `❌ **No favorite card set yet.**\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `💡 Use /fav &lt;card_id&gt; to set your favorite card!`,
+        { ...getReplyParams(ctx), parse_mode: 'HTML' }
+      );
+      return;
+    }
+    
+    // Get favorite card details
+    const favoriteCard = await prisma.card.findUnique({
+      where: { id: user.favoriteCardId }
+    });
+    
+    if (!favoriteCard) {
+      await ctx.reply(
+        `⭐ ━━━〔 FAVORITE CARD 〕━━━ ⭐\n\n` +
+        `❌ **Card Not Found**\n` +
+        `Your favorite card (ID: ${user.favoriteCardId}) no longer exists.\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `💡 Use /fav &lt;card_id&gt; to set a new favorite card!`,
+        { ...getReplyParams(ctx), parse_mode: 'HTML' }
+      );
+      return;
+    }
+    
+    // Send favorite card with image and nice formatting
+    const cardDetails = `⭐ ━━━ YOUR FAVORITE CARD ━━━ ⭐\n\n` +
+      `🏆 ${favoriteCard.name}\n` +
+      `🎯 Rarity: ${getRarityWithEmoji(favoriteCard.rarity)}\n` +
+      `🌍 Country: ${favoriteCard.country}\n` +
+      `━━━━━━━━━━━━━━━━━━\n`;
+    
+    if (favoriteCard.imageUrl && favoriteCard.imageUrl.startsWith('http')) {
+      await ctx.replyWithPhoto(
+        favoriteCard.imageUrl,
+        {
+          caption: cardDetails,
+          parse_mode: 'HTML',
+          ...getReplyParams(ctx)
+        }
+      );
+    } else {
+      await ctx.reply(cardDetails, { ...getReplyParams(ctx), parse_mode: 'HTML' });
+    }
+    return;
+  }
+  
+  const cardId = Number(parts[1]);
+  if (!cardId) {
+    await ctx.reply('Usage: /fav &lt;card_id&gt; to set favorite card\n/fav to show current favorite card', { ...getReplyParams(ctx), parse_mode: 'HTML' });
+    return;
+  }
+  
+  try {
+    // Check if user owns this card
+    const ownership = await prisma.ownership.findUnique({
+      where: {
+        userId_cardId: {
+          userId: user.id,
+          cardId: cardId
+        }
+      },
+      include: { card: true }
+    });
+    
+    if (!ownership) {
+      await ctx.reply(`You don't own any cards with ID ${cardId}.`, { ...getReplyParams(ctx) });
+      return;
+    }
+    
+    // Set as favorite card
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { favoriteCardId: cardId }
+    });
+    
+    await ctx.reply(
+      `⭐ ━━━〔 FAVORITE CARD SET 〕━━━ ⭐\n\n` +
+      `🏆 **${ownership.card.name}**\n` +
+      `🎯 ${getRarityWithEmoji(ownership.card.rarity)} **${ownership.card.rarity}**\n` +
+      `🌍 **Country:** ${ownership.card.country}\n` +
+      `⚡ **Role:** ${ownership.card.role}\n` +
+      `🆔 **Card ID:** ${cardId}\n\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `✨ This card will now appear in your /cards and /profile!`,
+      { ...getReplyParams(ctx), parse_mode: 'HTML' }
+    );
+    
+  } catch (e: any) {
+    await ctx.reply('Failed to set favorite card: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
+
 // Handler for Top Collectors button
 async function handleTopCollectors(ctx: any) {
   try {
@@ -2632,7 +2758,7 @@ async function handleTopCollectors(ctx: any) {
       // Add rank emoji
       const rankEmoji = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : '🏅';
       
-      message += `${rankEmoji} **${rank}.** ${userName} — **${quantity}** copies\n`;
+      message += `${rankEmoji} **${rank}.** ${userName} — **${quantity}** \n`;
     });
     
     message += `\n━━━━━━━━━━━━━━━━━━\n`;
