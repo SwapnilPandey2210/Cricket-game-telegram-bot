@@ -1631,28 +1631,39 @@ bot.command('profile', async (ctx) => {
     }
   });
   
-  // Build profile message
+  // Get today's collection count and rank info
+  const todayCollection = await getTodayCollectionCount(prisma, user.id);
   const username = user.firstName || user.username || 'Anonymous';
-  let profileMessage = `<b>👤 Profile</b>\n\n`;
-  profileMessage += `<b>Username:</b> ${username}\n`;
-  profileMessage += `<b>Total Cards Collected:</b> ${totalCardsCollected}\n`;
-  profileMessage += `<b>Total Unique Cards Owned:</b> ${totalUniqueCards}\n`;
-  profileMessage += `<b>Total Cards Owned:</b> ${totalCardsOwned}\n`;
-  profileMessage += `<b>Total Coins:</b> ${user.coins}\n\n`;
+  const userRank = calculateRank(totalCardsCollected);
+  const rankInfo = getRankInfo(userRank);
   
-  // Add rarity breakdown
-  profileMessage += `<b>📊 Cards by Rarity:</b>\n`;
+  // Build profile message with new formatting
+  let profileMessage = `🏏 ━━━〔 🧾 PLAYER PROFILE 〕━━━ 🏏\n\n`;
+  profileMessage += `👤 Username: ${username}\n`;
+  profileMessage += `🏆 Rank: ${userRank}️⃣ — ${rankInfo.emoji} *${rankInfo.name}*\n`;
+  profileMessage += `🃏 Total Cards Collected: ${totalCardsCollected}\n`;
+  profileMessage += `📦 Unique Cards Owned: ${totalUniqueCards}\n`;
+  profileMessage += `🗂️ Total Cards Owned: ${totalCardsOwned}\n`;
+  profileMessage += `🔥 Today's Collection: ${todayCollection}\n`;
+  profileMessage += `💰 Total Coins: ${user.coins.toLocaleString()}\n\n`;
+  
+  profileMessage += `━━━━━━━━━━━━━━━━━━\n`;
+  profileMessage += `📊 〔 CARDS BY RARITY 〕\n`;
+  
   // Show all rarities in the specified order, even if not owned
   validRarities.forEach(rarity => {
     const emoji = RARITY_EMOJIS[rarity] || '⭐';
     if (cardsByRarity[rarity]) {
       const stats = cardsByRarity[rarity];
-      profileMessage += `${emoji} ${rarity}: ${stats.total}(${stats.unique})\n`;
+      profileMessage += `${emoji} ${rarity}: ${stats.total} (${stats.unique})\n`;
     } else {
       // Show 0(0) for rarities not owned
-      profileMessage += `${emoji} ${rarity}: 0(0)\n`;
+      profileMessage += `${emoji} ${rarity}: 0 (0)\n`;
     }
   });
+  
+  profileMessage += `━━━━━━━━━━━━━━━━━━\n\n`;
+  profileMessage += `🏟️ Keep collecting to climb the leaderboard!`;
   
   await ctx.replyWithHTML(profileMessage, { ...getReplyParams(ctx) });
 });
@@ -1908,6 +1919,62 @@ const RARITY_FUSE_RATES: {
 // Function to get emoji for a rarity
 function getRarityWithEmoji(rarity: string): string {
   return `${RARITY_EMOJIS[rarity] || ''} ${rarity}`;
+}
+
+// Function to calculate user rank based on total cards collected
+function calculateRank(totalCardsCollected: number): number {
+  if (totalCardsCollected >= 0 && totalCardsCollected <= 100) return 1;
+  if (totalCardsCollected >= 101 && totalCardsCollected <= 250) return 2;
+  if (totalCardsCollected >= 251 && totalCardsCollected <= 1000) return 3;
+  if (totalCardsCollected >= 1001 && totalCardsCollected <= 2000) return 4;
+  if (totalCardsCollected >= 2001 && totalCardsCollected <= 3000) return 5;
+  if (totalCardsCollected >= 3001 && totalCardsCollected <= 5000) return 6;
+  if (totalCardsCollected >= 5001 && totalCardsCollected <= 7500) return 7;
+  if (totalCardsCollected >= 7501 && totalCardsCollected <= 10000) return 8;
+  if (totalCardsCollected >= 10001 && totalCardsCollected <= 20000) return 9;
+  if (totalCardsCollected >= 20001 && totalCardsCollected <= 40000) return 10;
+  if (totalCardsCollected >= 40001 && totalCardsCollected <= 75000) return 11;
+  return 12; // For 75000+ cards
+}
+
+// Function to get rank name and emoji
+function getRankInfo(rank: number): { emoji: string; name: string } {
+  const rankInfo: { [key: number]: { emoji: string; name: string } } = {
+    1: { emoji: '🪶', name: 'Rookie' },
+    2: { emoji: '🧒', name: 'Gully Champ' },
+    3: { emoji: '🏕️', name: 'Street Cricketer' },
+    4: { emoji: '🥉', name: 'Rising Talent' },
+    5: { emoji: '🧢', name: 'Club Captain' },
+    6: { emoji: '🧤', name: 'Power Striker' },
+    7: { emoji: '🏏', name: 'Pro Batter' },
+    8: { emoji: '🥈', name: 'All-Star Player' },
+    9: { emoji: '🏆', name: 'League Master' },
+    10: { emoji: '🥇', name: 'World Champion' },
+    11: { emoji: '🏅', name: 'Ultimate Legend' },
+    12: { emoji: '👑', name: 'Transcendent Master' }
+  };
+  return rankInfo[rank] || { emoji: '⭐', name: 'Unknown' };
+}
+
+// Function to get today's collection count
+async function getTodayCollectionCount(prisma: PrismaClient, userId: number): Promise<number> {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  
+  // Count cards collected today by checking ownership records created today
+  const todayOwnerships = await prisma.ownership.findMany({
+    where: {
+      userId: userId,
+      createdAt: {
+        gte: today,
+        lt: tomorrow
+      }
+    }
+  });
+  
+  return todayOwnerships.reduce((sum, ownership) => sum + ownership.quantity, 0);
 }
 
 // Utility function to get a random card with weighted probabilities
