@@ -429,7 +429,7 @@ bot.command('check', async (ctx) => {
   try {
     const card = await prisma.card.findUnique({ where: { id: cardId } });
     if (!card) return ctx.reply('Card not found.', { ...getReplyParams(ctx) });
-    await sendCardDetails(ctx, card);
+    await sendCardDetails(ctx, card, undefined, undefined, true); // Pass showTopCollectors = true
   } catch (e: any) {
     await ctx.reply('Error fetching card details.', { ...getReplyParams(ctx) });
   }
@@ -2128,24 +2128,33 @@ function isValidImageUrl(url: string): boolean {
 }
 
 // Helper function to send card details with image
-async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: string) {
+async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: string, showTopCollectors?: boolean) {
   // Always use ctx.telegram.sendPhoto for sending images, to avoid argument confusion
 
   // Debug log to verify arguments
   console.log('sendCardDetails called with:', {
     chatId: chatId || ctx.chat.id,
     imageUrl: card.imageUrl,
-    card
+    card,
+    showTopCollectors
   });
 
   if (typeof card.imageUrl !== 'string' || !card.imageUrl.startsWith('http')) {
     console.error('Invalid imageUrl:', card.imageUrl);
     // Fallback: If no image or image sending failed, send text-only message
     const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+    
+    // Add Top Collectors button if requested
+    const replyMarkup = showTopCollectors ? {
+      inline_keyboard: [
+        [{ text: '🏆 Top Collectors', callback_data: `top_collectors_${card.id}` }]
+      ]
+    } : undefined;
+    
     await ctx.telegram.sendMessage(
       chatId || ctx.chat.id,
       cardDetails,
-      { parse_mode: 'HTML', ...getReplyParams(ctx) }
+      { parse_mode: 'HTML', reply_markup: replyMarkup, ...getReplyParams(ctx) }
     );
     return true;
   }
@@ -2153,12 +2162,21 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
   try {
     const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
     console.log('Calling sendPhoto with:', chatId || ctx.chat.id, card.imageUrl);
+    
+    // Add Top Collectors button if requested
+    const replyMarkup = showTopCollectors ? {
+      inline_keyboard: [
+        [{ text: '🏆 Top Collectors', callback_data: `top_collectors_${card.id}` }]
+      ]
+    } : undefined;
+    
     await ctx.telegram.sendPhoto(
       chatId || ctx.chat.id,
       card.imageUrl,
       {
         caption: cardDetails,
         parse_mode: 'HTML',
+        reply_markup: replyMarkup,
         ...getReplyParams(ctx)
       }
     );
@@ -2347,6 +2365,77 @@ async function handleFuseConfirmRarity(ctx: any) {
   }
 }
 
+// Handler for Top Collectors button
+async function handleTopCollectors(ctx: any) {
+  try {
+    const data = ctx.callbackQuery.data;
+    const cardId = Number(data.replace('top_collectors_', ''));
+    
+    if (!cardId) {
+      await ctx.answerCbQuery('Invalid card ID.');
+      return;
+    }
+    
+    // Get the card details first
+    const card = await prisma.card.findUnique({ where: { id: cardId } });
+    if (!card) {
+      await ctx.answerCbQuery('Card not found.');
+      return;
+    }
+    
+    // Get top 10 collectors of this card
+    const topCollectors = await prisma.ownership.findMany({
+      where: { cardId: cardId },
+      include: { user: true },
+      orderBy: { quantity: 'desc' },
+      take: 10
+    });
+    
+    if (topCollectors.length === 0) {
+      const noCollectorsMessage = `🏆 **Top Collectors for ${card.name}**\n\n` +
+        `No one owns this card yet! Be the first to collect it! 🎯`;
+      
+      try {
+        await ctx.editMessageText(noCollectorsMessage, { parse_mode: 'Markdown' });
+      } catch (error) {
+        // If editMessageText fails, try editMessageCaption (for photo messages)
+        await ctx.editMessageCaption(noCollectorsMessage, { parse_mode: 'Markdown' });
+      }
+      await ctx.answerCbQuery('No collectors found.');
+      return;
+    }
+    
+    // Build the top collectors message
+    let message = `🏆 **Top Collectors for ${card.name}**\n\n`;
+    
+    topCollectors.forEach((ownership, index) => {
+      const rank = index + 1;
+      const userName = ownership.user.firstName || ownership.user.username || 'Anonymous';
+      const quantity = ownership.quantity;
+      
+      // Add rank emoji
+      const rankEmoji = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : '🏅';
+      
+      message += `${rankEmoji} **${rank}.** ${userName} — **${quantity}** copies\n`;
+    });
+    
+    message += `\n━━━━━━━━━━━━━━━━━━\n`;
+    message += `📊 Total collectors: ${topCollectors.length}`;
+    
+    try {
+      await ctx.editMessageText(message, { parse_mode: 'Markdown' });
+    } catch (error) {
+      // If editMessageText fails, try editMessageCaption (for photo messages)
+      await ctx.editMessageCaption(message, { parse_mode: 'Markdown' });
+    }
+    await ctx.answerCbQuery('Top collectors displayed!');
+    
+  } catch (error) {
+    console.error('Error in handleTopCollectors:', error);
+    await ctx.answerCbQuery('Error loading top collectors.');
+  }
+}
+
 // Updated Callback query handler to show complete card details
 bot.on("callback_query", async (ctx, next) => {
   if ('data' in ctx.callbackQuery) {
@@ -2374,6 +2463,8 @@ bot.on("callback_query", async (ctx, next) => {
       await handleFuseConfirmCard(ctx);
     } else if (data.startsWith("fuse_confirm_rarity_")) {
       await handleFuseConfirmRarity(ctx);
+    } else if (data.startsWith("top_collectors_")) {
+      await handleTopCollectors(ctx);
     } else {
       return next();
     }
