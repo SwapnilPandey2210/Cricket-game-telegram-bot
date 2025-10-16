@@ -1,0 +1,26 @@
+Cricket Heritage Bot Deployment
+===============================
+Environment: production
+Region: us-east-1
+S3 Bucket: cricket-heritage-bot-backups-1760623180
+Deployment Date: 2025-10-16 19:35:09
+AWS Account: 908228721731
+
+Files Included:
+- dist/ (compiled application)
+- prisma/ (database files)
+- scripts/ (backup and utility scripts)
+- package.json & package-lock.json (dependencies)
+- .env (environment variables)
+- start.sh (startup script)
+- backup-cron.sh (backup script)
+
+Next Steps:
+1. Upload this folder to your server
+2. Run: ./start.sh
+3. Set up cron job: 0 2 * * * /path/to/backup-cron.sh
+
+Cost Estimation:
+- S3 Storage: ~$0.10-0.50/month
+- EC2 Instance: ~$5-20/month
+- Total: ~$5-25/month
