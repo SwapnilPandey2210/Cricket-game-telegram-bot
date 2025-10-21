@@ -1,4 +1,4 @@
-import { Telegraf, Markup, Scenes, session } from 'telegraf';
+import { Telegraf, Markup } from 'telegraf';
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
@@ -12,6 +12,107 @@ async function isAdmin(user) {
         where: { id: user.id }
     });
     return dbUser?.isAdmin || false;
+}
+// Helper function to get the next available card ID
+async function getNextCardId(prisma) {
+    const existingCards = await prisma.card.findMany({
+        select: { id: true },
+        orderBy: { id: 'asc' }
+    });
+    const existingIds = new Set(existingCards.map(card => card.id));
+    // Find the first missing ID starting from 1
+    for (let id = 1; id <= existingCards.length + 1; id++) {
+        if (!existingIds.has(id)) {
+            return id;
+        }
+    }
+    // If no gaps found, return the next sequential ID
+    return existingCards.length + 1;
+}
+// Helper function to reorder card IDs to fill gaps
+async function reorderCardIds(prisma) {
+    const existingCards = await prisma.card.findMany({
+        orderBy: { id: 'asc' }
+    });
+    if (existingCards.length === 0)
+        return;
+    // Check if there are gaps
+    const hasGaps = existingCards.some((card, index) => card.id !== index + 1);
+    if (!hasGaps)
+        return; // No gaps to fill
+    console.log('Reordering card IDs to fill gaps...');
+    // Create a mapping of old IDs to new sequential IDs
+    const idMapping = new Map();
+    existingCards.forEach((card, index) => {
+        idMapping.set(card.id, index + 1);
+    });
+    // Update all related tables in a transaction
+    await prisma.$transaction(async (tx) => {
+        // Update Ownership table
+        for (const [oldId, newId] of idMapping) {
+            if (oldId !== newId) {
+                await tx.ownership.updateMany({
+                    where: { cardId: oldId },
+                    data: { cardId: newId }
+                });
+            }
+        }
+        // Update Listing table
+        for (const [oldId, newId] of idMapping) {
+            if (oldId !== newId) {
+                await tx.listing.updateMany({
+                    where: { cardId: oldId },
+                    data: { cardId: newId }
+                });
+            }
+        }
+        // Update Trade table (offered cards)
+        for (const [oldId, newId] of idMapping) {
+            if (oldId !== newId) {
+                await tx.trade.updateMany({
+                    where: { offeredCardId: oldId },
+                    data: { offeredCardId: newId }
+                });
+            }
+        }
+        // Update Trade table (requested cards)
+        for (const [oldId, newId] of idMapping) {
+            if (oldId !== newId) {
+                await tx.trade.updateMany({
+                    where: { requestedCardId: oldId },
+                    data: { requestedCardId: newId }
+                });
+            }
+        }
+        // Update FuseLock table
+        for (const [oldId, newId] of idMapping) {
+            if (oldId !== newId) {
+                await tx.fuseLock.updateMany({
+                    where: { cardId: oldId },
+                    data: { cardId: newId }
+                });
+            }
+        }
+        // Update User favoriteCardId
+        for (const [oldId, newId] of idMapping) {
+            if (oldId !== newId) {
+                await tx.user.updateMany({
+                    where: { favoriteCardId: oldId },
+                    data: { favoriteCardId: newId }
+                });
+            }
+        }
+        // Finally, update Card IDs
+        for (const [oldId, newId] of idMapping) {
+            if (oldId !== newId) {
+                await tx.card.update({
+                    where: { id: oldId },
+                    data: { id: newId }
+                });
+            }
+        }
+    });
+    console.log('Card IDs reordered successfully!');
 }
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -81,128 +182,318 @@ bot.command('openpack', async (ctx) => {
     }
 });
 // Helper function to send card details with image
-const addCardWizard = new Scenes.WizardScene('add-card-wizard', 
-// Step 1: Enter card name (slug will be auto-generated)
-async (ctx) => {
+// Temporarily disabled wizard to ensure bot stability
+/*
+const addCardWizard = new Scenes.WizardScene<MyWizardContext>(
+  'add-card-wizard',
+  // Step 1: Enter card name (slug will be auto-generated)
+  async (ctx) => {
+    try {
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    ctx.wizard.state.card = {}; // Initialize the card object
+    (ctx.wizard.state as any).card = {}; // Initialize the card object
+      
+      try {
     await ctx.reply('Enter card name:', {
-        ...(reply_parameters ? { reply_parameters } : {})
+      ...(reply_parameters ? { reply_parameters } : {})
     });
+      } catch (error) {
+        // If reply fails (message not found), send without reply
+        await ctx.reply('Enter card name:');
+      }
     return ctx.wizard.next();
-}, 
-// Step 2: Show rarity options
-async (ctx) => {
-    if (!ctx.message || !('text' in ctx.message))
-        return;
+    } catch (error: any) {
+      console.error('Error in wizard step 1:', error);
+      try {
+        await ctx.reply('❌ An error occurred. Please try the /addcard command again.');
+        return ctx.scene.leave();
+      } catch (replyError) {
+        console.error('Failed to send error reply in wizard step 1:', replyError);
+        return ctx.scene.leave();
+      }
+    }
+  },
+  // Step 2: Show rarity options
+  async (ctx) => {
+    try {
+      if (!ctx.message || !('text' in ctx.message)) {
+        await ctx.reply('❌ Invalid input. Please try the /addcard command again.');
+        return ctx.scene.leave();
+      }
+    
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
     const name = ctx.message.text;
-    ctx.wizard.state.card.name = name;
-    ctx.wizard.state.userId = ctx.from?.id; // Store user ID
+    (ctx.wizard.state as any).card.name = name;
+    (ctx.wizard.state as any).userId = ctx.from?.id; // Store user ID
+    
     const keyboard = {
-        inline_keyboard: [
-            [
-                { text: '🥉 Common', callback_data: 'rarity_COMMON' },
-                { text: '🥈 Medium', callback_data: 'rarity_MEDIUM' }
-            ],
-            [
-                { text: '🥇 Rare', callback_data: 'rarity_RARE' },
-                { text: '🟡 Legendary', callback_data: 'rarity_LEGENDARY' }
-            ],
-            [
-                { text: '💮 Exclusive', callback_data: 'rarity_EXCLUSIVE' },
-                { text: '🔮 Limited Edition', callback_data: 'rarity_LIMITED' }
-            ],
-            [
-                { text: '💠 Cosmic', callback_data: 'rarity_COSMIC' },
-                { text: '♠️ Prime', callback_data: 'rarity_PRIME' }
-            ],
-            [
-                { text: '🧿 Premium', callback_data: 'rarity_PREMIUM' }
-            ]
+      inline_keyboard: [
+        [
+          { text: '🥉 Common', callback_data: 'rarity_COMMON' },
+          { text: '🥈 Medium', callback_data: 'rarity_MEDIUM' }
+        ],
+        [
+          { text: '🥇 Rare', callback_data: 'rarity_RARE' },
+          { text: '🟡 Legendary', callback_data: 'rarity_LEGENDARY' }
+        ],
+        [
+          { text: '💮 Exclusive', callback_data: 'rarity_EXCLUSIVE' },
+          { text: '🔮 Limited Edition', callback_data: 'rarity_LIMITED' }
+        ],
+        [
+          { text: '💠 Cosmic', callback_data: 'rarity_COSMIC' },
+          { text: '♠️ Prime', callback_data: 'rarity_PRIME' }
+        ],
+        [
+          { text: '🧿 Premium', callback_data: 'rarity_PREMIUM' }
         ]
+      ]
     };
+    
+      try {
     await ctx.reply('Select card rarity:', {
-        reply_markup: keyboard,
-        ...(reply_parameters ? { reply_parameters } : {})
+      reply_markup: keyboard,
+      ...(reply_parameters ? { reply_parameters } : {})
     });
+      } catch (error) {
+        // If reply fails (message not found), send without reply
+        await ctx.reply('Select card rarity:', { reply_markup: keyboard });
+      }
     return ctx.wizard.next();
-}, 
-// Step 4: Handle rarity selection and ask for country
-async (ctx) => {
+    } catch (error: any) {
+      console.error('Error in wizard step 2:', error);
+      try {
+        await ctx.reply('❌ An error occurred. Please try the /addcard command again.');
+        return ctx.scene.leave();
+      } catch (replyError) {
+        console.error('Failed to send error reply in wizard step 2:', replyError);
+        return ctx.scene.leave();
+      }
+    }
+  },
+  // Step 4: Handle rarity selection and ask for country
+  async (ctx) => {
     // Handle both message and callback_query updates
     if (ctx.callbackQuery) {
-        const callbackQuery = ctx.callbackQuery;
-        if (!callbackQuery.data?.startsWith('rarity_')) {
-            await ctx.answerCbQuery('Invalid selection');
-            return;
-        }
-        // Check if this is the user who started the wizard
-        if (!ctx.from || ctx.from.id !== ctx.wizard.state.userId) {
-            await ctx.answerCbQuery('Only the user who started the command can select options');
-            return;
-        }
-        const rarity = callbackQuery.data.replace('rarity_', '');
-        ctx.wizard.state.card.rarity = rarity;
-        // Remove the inline keyboard and show selection
-        await ctx.editMessageText(`Selected rarity: ${rarity}`);
-        await ctx.answerCbQuery();
-        // Move to country input
-        await ctx.reply('Enter country/team:', { ...getReplyParams(ctx) });
-        return ctx.wizard.next();
+      const callbackQuery = ctx.callbackQuery as any;
+      if (!callbackQuery.data?.startsWith('rarity_')) {
+        await ctx.answerCbQuery('Invalid selection');
+        return;
+      }
+
+      // Check if this is the user who started the wizard
+      if (!ctx.from || ctx.from.id !== (ctx.wizard.state as any).userId) {
+        await ctx.answerCbQuery('Only the user who started the command can select options');
+        return;
+      }
+
+      const rarity = callbackQuery.data.replace('rarity_', '');
+      (ctx.wizard.state as any).card.rarity = rarity;
+
+      // Remove the inline keyboard and show selection
+      await ctx.editMessageText(`Selected rarity: ${rarity}`);
+      await ctx.answerCbQuery();
+
+      // Move to country input
+      await ctx.reply('Enter country/team:', { ...getReplyParams(ctx) });
+      return ctx.wizard.next();
     }
+
     // If we get a message instead of a callback, remind to use buttons
     if (ctx.message) {
-        await ctx.reply('Please use the buttons above to select a rarity');
-        return;
+      await ctx.reply('Please use the buttons above to select a rarity');
+      return;
     }
-}, async (ctx) => {
+  },
+  async (ctx) => {
     const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    ctx.wizard.state.card.country = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
-    await ctx.reply('Enter role (e.g. Batsman, Bowler, All-rounder):', {
-        ...(reply_parameters ? { reply_parameters } : {})
-    });
-    return ctx.wizard.next();
-}, async (ctx) => {
-    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    ctx.wizard.state.card.role = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
-    await ctx.reply('Enter bio (or type "skip"):', {
-        ...(reply_parameters ? { reply_parameters } : {})
-    });
-    return ctx.wizard.next();
-}, async (ctx) => {
-    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    ctx.wizard.state.card.bio = ctx.message && 'text' in ctx.message && ctx.message.text === 'skip' ? null : ctx.message && 'text' in ctx.message ? ctx.message.text : null;
-    await ctx.reply('Enter image URL (or type "skip"):', {
-        ...(reply_parameters ? { reply_parameters } : {})
-    });
-    return ctx.wizard.next();
-}, async (ctx) => {
-    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
-    ctx.wizard.state.card.imageUrl = ctx.message && 'text' in ctx.message && ctx.message.text === 'skip' ? null : ctx.message && 'text' in ctx.message ? ctx.message.text : null;
+    (ctx.wizard.state as any).card.country = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
     try {
-        const card = await prisma.card.create({ data: ctx.wizard.state.card });
-        const cardDetails = `<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
-        await ctx.replyWithHTML(cardDetails, {
-            ...(reply_parameters ? { reply_parameters } : {})
-        });
+    await ctx.reply('Enter role (e.g. Batsman, Bowler, All-rounder):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
+    } catch (error) {
+      await ctx.reply('Enter role (e.g. Batsman, Bowler, All-rounder):');
     }
-    catch (e) {
-        await ctx.reply(`Error adding card: ${e.message}`, {
-            ...(reply_parameters ? { reply_parameters } : {})
-        });
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
+    (ctx.wizard.state as any).card.role = ctx.message && 'text' in ctx.message ? (ctx.message as any).text : '';
+    try {
+    await ctx.reply('Enter bio (or type "skip"):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
+    } catch (error) {
+      await ctx.reply('Enter bio (or type "skip"):');
+    }
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
+    (ctx.wizard.state as any).card.bio = ctx.message && 'text' in ctx.message && (ctx.message as any).text === 'skip' ? null : ctx.message && 'text' in ctx.message ? (ctx.message as any).text : null;
+    try {
+    await ctx.reply('Enter image URL (or type "skip"):', {
+      ...(reply_parameters ? { reply_parameters } : {})
+    });
+    } catch (error) {
+      await ctx.reply('Enter image URL (or type "skip"):');
+    }
+    return ctx.wizard.next();
+  },
+  async (ctx) => {
+    const reply_parameters = ctx.message?.message_id ? { message_id: ctx.message.message_id } : undefined;
+    (ctx.wizard.state as any).card.imageUrl = ctx.message && 'text' in ctx.message && (ctx.message as any).text === 'skip' ? null : ctx.message && 'text' in ctx.message ? (ctx.message as any).text : null;
+    try {
+      // Get the next available card ID
+      const nextId = await getNextCardId(prisma);
+      (ctx.wizard.state as any).card.id = nextId;
+      
+      const card = await prisma.card.create({ data: (ctx.wizard.state as any).card });
+      const cardDetails = `<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${(card as any).bio ? `\n<b>Bio:</b> ${(card as any).bio}` : ''}`;
+      await ctx.replyWithHTML(cardDetails, {
+        ...(reply_parameters ? { reply_parameters } : {})
+      });
+    } catch (e: any) {
+      await ctx.reply(`Error adding card: ${e.message}`, {
+        ...(reply_parameters ? { reply_parameters } : {})
+      });
     }
     return ctx.scene.leave();
-});
-const stage = new Scenes.Stage([addCardWizard]);
-bot.use(session());
-bot.use(stage.middleware());
+  }
+);
+*/
+// Temporarily disabled wizard scenes to ensure bot stability
+// const stage = new Scenes.Stage<MyWizardContext>([addCardWizard]);
+// bot.use(session() as any);
+// bot.use(stage.middleware() as any);
 bot.command('addcard', async (ctx) => {
-    const user = await ensureUser(prisma, ctx.from);
-    if (!await isAdmin({ id: user.id })) {
-        return ctx.reply('Only admins can use this command.');
+    try {
+        const user = await ensureUser(prisma, ctx.from);
+        if (!await isAdmin({ id: user.id })) {
+            return ctx.reply('Only admins can use this command.');
+        }
+        // Clear any existing state for this user
+        addCardStates.delete(user.id);
+        // Initialize the addcard wizard state
+        addCardStates.set(user.id, {
+            step: 'name',
+            card: {}
+        });
+        await ctx.reply('📝 Add Card Wizard\n\n' +
+            'Step 1/6: Enter the card name:\n\n' +
+            'Example: Virat Kohli or MS Dhoni', { ...getReplyParams(ctx) });
     }
-    ctx.scene.enter('add-card-wizard');
+    catch (error) {
+        console.error('Error in addcard command:', error);
+        // Clear state on error
+        if (ctx.from) {
+            addCardStates.delete(ctx.from.id);
+        }
+        try {
+            await ctx.reply('❌ An error occurred. Please try again later.');
+        }
+        catch (replyError) {
+            console.error('Failed to send error reply:', replyError);
+        }
+    }
+});
+// Command to cancel addcard wizard
+bot.command('canceladdcard', async (ctx) => {
+    try {
+        const user = await ensureUser(prisma, ctx.from);
+        if (!await isAdmin({ id: user.id })) {
+            return ctx.reply('Only admins can use this command.');
+        }
+        if (addCardStates.has(user.id)) {
+            addCardStates.delete(user.id);
+            await ctx.reply('✅ Add card wizard cancelled.', { ...getReplyParams(ctx) });
+        }
+        else {
+            await ctx.reply('No active add card wizard to cancel.', { ...getReplyParams(ctx) });
+        }
+    }
+    catch (error) {
+        console.error('Error in canceladdcard command:', error);
+        try {
+            await ctx.reply('❌ An error occurred. Please try again later.');
+        }
+        catch (replyError) {
+            console.error('Failed to send error reply:', replyError);
+        }
+    }
+});
+// Search command for finding cards
+bot.command('search', async (ctx) => {
+    try {
+        const user = await ensureUser(prisma, ctx.from);
+        const args = ctx.message.text.split(' ').slice(1);
+        if (args.length === 0) {
+            // If no search term, show the search interface with inline button
+            const searchMessage = '🔍 SEARCH ALL THE [PLAYERS] UPLOADED BY CLICKING THE BUTTON BELOW 📱';
+            const keyboard = {
+                inline_keyboard: [
+                    [{ text: '🔍 Search Player', switch_inline_query_current_chat: '' }]
+                ]
+            };
+            await ctx.reply(searchMessage, {
+                ...getReplyParams(ctx),
+                reply_markup: keyboard
+            });
+            return;
+        }
+        const searchTerm = args.join(' ').trim();
+        if (searchTerm.length < 2) {
+            await ctx.reply('❌ Search term must be at least 2 characters long.', { ...getReplyParams(ctx) });
+            return;
+        }
+        // Search for cards containing the query in name
+        const searchResults = await prisma.card.findMany({
+            where: {
+                name: {
+                    contains: searchTerm
+                }
+            },
+            take: 10,
+            orderBy: [
+                { rarity: 'asc' }, // Show higher rarities first
+                { name: 'asc' }
+            ]
+        });
+        if (searchResults.length === 0) {
+            await ctx.reply(`🔍 **Search Results for "${searchTerm}"**\n\n` +
+                `❌ No cards found for "${searchTerm}"\n\n` +
+                `💡 **Search Tips:**\n` +
+                `• Try different spellings\n` +
+                `• Use partial names (e.g., "Rohit" instead of "Rohit Sharma")\n` +
+                `• Check /allcards to see all available cards`, {
+                ...getReplyParams(ctx),
+                parse_mode: 'HTML'
+            });
+            return;
+        }
+        let resultMessage = `🔍 **Search Results for "${searchTerm}"**\n\n`;
+        resultMessage += `Found ${searchResults.length} card(s):\n\n`;
+        searchResults.forEach((card, index) => {
+            resultMessage += `${index + 1}. **${card.name}**\n`;
+            resultMessage += `   ${getRarityWithEmoji(card.rarity)} ${card.rarity} • ${card.country} ${getCountryFlag(card.country)}\n`;
+            resultMessage += `   ID: ${card.id} • Role: ${card.role}\n\n`;
+        });
+        resultMessage += `━━━━━━━━━━━━━━━━━━\n`;
+        resultMessage += `💡 Use /check card_id for more details`;
+        await ctx.reply(resultMessage, {
+            ...getReplyParams(ctx),
+            parse_mode: 'HTML'
+        });
+    }
+    catch (error) {
+        console.error('Error in search command:', error);
+        try {
+            await ctx.reply('❌ An error occurred while searching. Please try again later.');
+        }
+        catch (replyError) {
+            console.error('Failed to send error reply:', replyError);
+        }
+    }
 });
 // Command to delete a card: /deletecard card_id (admin only)
 bot.command('deletecard', async (ctx) => {
@@ -247,6 +538,15 @@ bot.command('deletecard', async (ctx) => {
                     ]
                 }
             });
+            // Delete all fuse locks for this card
+            await tx.fuseLock.deleteMany({
+                where: { cardId }
+            });
+            // Clear favorite card references
+            await tx.user.updateMany({
+                where: { favoriteCardId: cardId },
+                data: { favoriteCardId: null }
+            });
             // Finally delete the card
             return await tx.card.delete({
                 where: { id: cardId }
@@ -256,6 +556,21 @@ bot.command('deletecard', async (ctx) => {
     }
     catch (e) {
         await ctx.reply(`Error deleting card: ${e.message}`, { ...getReplyParams(ctx) });
+    }
+});
+// Command to reorder card IDs: /reordercards (admin only)
+bot.command('reordercards', async (ctx) => {
+    const user = await ensureUser(prisma, ctx.from);
+    if (!await isAdmin({ id: user.id })) {
+        return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+    }
+    try {
+        await ctx.reply('🔄 Reordering card IDs to fill gaps...', { ...getReplyParams(ctx) });
+        await reorderCardIds(prisma);
+        await ctx.reply('✅ Card IDs have been reordered successfully! All gaps have been filled.', { ...getReplyParams(ctx) });
+    }
+    catch (e) {
+        await ctx.reply(`Error reordering cards: ${e.message}`, { ...getReplyParams(ctx) });
     }
 });
 // Command to change card rarity: /changerarity card_id (admin only)
@@ -364,6 +679,9 @@ bot.command('daan', async (ctx) => {
             });
         });
         const targetUserName = targetUser.firstName || targetUser.username || 'User';
+        // Send enhanced collection message to the target user
+        await sendCardCollectionMessage(ctx, card, targetUserName);
+        // Also send confirmation to admin
         await ctx.reply(`✅ Card given successfully!\n\n` +
             `Given to: ${targetUserName}\n` +
             `Card: ${getRarityWithEmoji(card.rarity)} ${card.name}\n` +
@@ -721,6 +1039,55 @@ bot.action(/^cards:prev:(\d+)$/, async (ctx) => {
     });
     await ctx.answerCbQuery();
 });
+// Handle allcards pagination
+bot.action(/^allcards:(\d+)$/, async (ctx) => {
+    const page = Number(ctx.match[1]);
+    const CARDS_PER_PAGE = 15;
+    const skip = (page - 1) * CARDS_PER_PAGE;
+    try {
+        // Get total count of cards
+        const totalCards = await prisma.card.count();
+        const totalPages = Math.ceil(totalCards / CARDS_PER_PAGE);
+        if (page > totalPages || page < 1) {
+            await ctx.answerCbQuery('Invalid page number.');
+            return;
+        }
+        // Get cards for current page
+        const cards = await prisma.card.findMany({
+            orderBy: { id: 'asc' },
+            skip: skip,
+            take: CARDS_PER_PAGE
+        });
+        // Build message
+        let message = `🃏 All Cards (Page ${page}/${totalPages})\n\n`;
+        message += `📊 Total Cards: ${totalCards}\n`;
+        message += `━━━━━━━━━━━━━━━━━━\n\n`;
+        cards.forEach((card, index) => {
+            const globalIndex = skip + index + 1;
+            message += `${card.name}`;
+            message += `   ID: ${card.id} | ${getRarityWithEmoji(card.rarity)}\n`;
+        });
+        // Add pagination buttons
+        const buttons = [];
+        if (page > 1) {
+            buttons.push({ text: '⬅️ Previous', callback_data: `allcards:${page - 1}` });
+        }
+        if (page < totalPages) {
+            buttons.push({ text: 'Next ➡️', callback_data: `allcards:${page + 1}` });
+        }
+        await ctx.editMessageText(message, {
+            parse_mode: 'HTML',
+            reply_markup: buttons.length ? {
+                inline_keyboard: [buttons]
+            } : undefined
+        });
+        await ctx.answerCbQuery();
+    }
+    catch (error) {
+        console.error('Error in allcards pagination:', error);
+        await ctx.answerCbQuery('Error loading page.');
+    }
+});
 // Handle /cards command with different modes
 bot.command('cards', async (ctx) => {
     const user = await ensureUser(prisma, ctx.from);
@@ -825,7 +1192,7 @@ bot.command('leaderboard', async (ctx) => {
     if (top.length === 0)
         return ctx.reply('No players yet. Be the first!', { ...getReplyParams(ctx) });
     const msg = top.map((u, i) => `${i + 1}. ${u.username ?? u.firstName ?? 'Anonymous'} — ${u.totalCardsCollected} cards`).join('\n');
-    await ctx.reply(`🏆 **Top 10 Card Collectors**\n\n${msg}`, { ...getReplyParams(ctx), parse_mode: 'Markdown' });
+    await ctx.reply(`🏆 Top 10 Card Collectors\n\n${msg}`, { ...getReplyParams(ctx) });
 });
 bot.hears('🏆 Leaderboard', async (ctx) => {
     const top = await getLeaderboard(prisma);
@@ -1073,6 +1440,33 @@ bot.action(/^change_rarity_(\d+)_(.+)$/, async (ctx) => {
         await ctx.answerCbQuery(`Failed to change rarity: ${e.message}`);
     }
 });
+// Addcard wizard rarity selection handler
+bot.action(/^addcard_rarity_(.+)$/, async (ctx) => {
+    try {
+        const user = await ensureUser(prisma, ctx.from);
+        if (!await isAdmin({ id: user.id })) {
+            await ctx.answerCbQuery('Only admins can add cards.');
+            return;
+        }
+        const rarity = ctx.match[1];
+        const state = addCardStates.get(user.id);
+        if (!state || state.step !== 'rarity') {
+            await ctx.answerCbQuery('Invalid wizard state. Please start over with /addcard');
+            return;
+        }
+        // Update the card with selected rarity
+        state.card.rarity = rarity;
+        state.step = 'country';
+        await ctx.editMessageText(`✅ Rarity selected: ${getRarityWithEmoji(rarity)} ${rarity}\n\n` +
+            `Step 3/6: Enter the country/team:\n\n` +
+            `Example: India, Australia, England`);
+        await ctx.answerCbQuery('Rarity selected!');
+    }
+    catch (error) {
+        console.error('Error in addcard rarity selection:', error);
+        await ctx.answerCbQuery('❌ An error occurred. Please try again.');
+    }
+});
 bot.command('accept', async (ctx) => {
     const user = await ensureUser(prisma, ctx.from);
     const parts = (ctx.message.text || '').split(/\s+/);
@@ -1273,12 +1667,71 @@ bot.command('gift', async (ctx) => {
         await ctx.reply(`Gift failed: ${e.message}`);
     }
 });
+// Command to show all cards with pagination
+bot.command('allcards', async (ctx) => {
+    const user = await ensureUser(prisma, ctx.from);
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const page = parts[1] ? parseInt(parts[1]) : 1;
+    if (isNaN(page) || page < 1) {
+        await ctx.reply('Please provide a valid page number. Usage: /allcards [page]', { ...getReplyParams(ctx) });
+        return;
+    }
+    const CARDS_PER_PAGE = 15;
+    const skip = (page - 1) * CARDS_PER_PAGE;
+    try {
+        // Get total count of cards
+        const totalCards = await prisma.card.count();
+        const totalPages = Math.ceil(totalCards / CARDS_PER_PAGE);
+        if (page > totalPages && totalPages > 0) {
+            await ctx.reply(`Page ${page} does not exist. There are only ${totalPages} page(s).`, { ...getReplyParams(ctx) });
+            return;
+        }
+        if (totalCards === 0) {
+            await ctx.reply('No cards found in the database.', { ...getReplyParams(ctx) });
+            return;
+        }
+        // Get cards for current page
+        const cards = await prisma.card.findMany({
+            orderBy: { id: 'asc' },
+            skip: skip,
+            take: CARDS_PER_PAGE
+        });
+        // Build message
+        let message = `🃏 **All Cards (Page ${page}/${totalPages})**\n\n`;
+        message += `📊 Total Cards: ${totalCards}\n`;
+        message += `━━━━━━━━━━━━━━━━━━\n\n`;
+        cards.forEach((card, index) => {
+            const globalIndex = skip + index + 1;
+            message += `${card.name}`;
+            message += `   ID: ${card.id} | ${getRarityWithEmoji(card.rarity)}\n`;
+        });
+        // Add pagination buttons
+        const buttons = [];
+        if (page > 1) {
+            buttons.push({ text: '⬅️ Previous', callback_data: `allcards:${page - 1}` });
+        }
+        if (page < totalPages) {
+            buttons.push({ text: 'Next ➡️', callback_data: `allcards:${page + 1}` });
+        }
+        await ctx.reply(message, {
+            ...getReplyParams(ctx),
+            parse_mode: 'HTML',
+            reply_markup: buttons.length ? {
+                inline_keyboard: [buttons]
+            } : undefined
+        });
+    }
+    catch (error) {
+        console.error('Error in /allcards command:', error);
+        await ctx.reply('Error fetching cards. Please try again.', { ...getReplyParams(ctx) });
+    }
+});
 bot.command('help', async (ctx) => {
     const user = await ensureUser(prisma, ctx.from);
     const isUserAdmin = await isAdmin({ id: user.id });
-    let helpText = '/start, /help, /profile, /pack, /cards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
+    let helpText = '/start, /help, /profile, /pack, /cards, /allcards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
     if (isUserAdmin) {
-        helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/changerarity - Change card rarity\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
+        helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changebio - Change card bio\n/changecountry - Change card country\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
     }
     await ctx.reply(helpText);
 });
@@ -1376,6 +1829,81 @@ bot.command('removeadmin', async (ctx) => {
     }
     catch (e) {
         await ctx.reply(`Failed to remove admin rights: ${e.message}`);
+    }
+});
+// In-memory map to track pending bio changes (avoiding session conflicts)
+const pendingBioChanges = new Map(); // userId -> cardId
+// In-memory map to track addcard wizard state (avoiding session conflicts)
+const addCardStates = new Map(); // userId -> wizard state
+// Cleanup function to remove old pending changes (5 minutes timeout)
+setInterval(() => {
+    // This is a simple cleanup - in production you might want to track timestamps
+    // For now, we'll just clear the maps periodically to prevent memory leaks
+    if (pendingBioChanges.size > 100) {
+        pendingBioChanges.clear();
+        console.log('Cleared pending bio changes map to prevent memory leaks');
+    }
+    if (addCardStates.size > 100) {
+        addCardStates.clear();
+        console.log('Cleared addcard states map to prevent memory leaks');
+    }
+}, 5 * 60 * 1000); // 5 minutes
+// Command to change card bio
+bot.command('changebio', async (ctx) => {
+    const admin = await ensureUser(prisma, ctx.from);
+    if (!await isAdmin({ id: admin.id })) {
+        return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+    }
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const cardId = Number(parts[1]);
+    if (!cardId) {
+        return ctx.reply('Usage: /changebio <cardId>\n\nExample: /changebio 123', { ...getReplyParams(ctx) });
+    }
+    try {
+        const card = await prisma.card.findUnique({ where: { id: cardId } });
+        if (!card) {
+            return ctx.reply('Card not found.', { ...getReplyParams(ctx) });
+        }
+        // Store the card ID in memory for this user
+        pendingBioChanges.set(admin.id, cardId);
+        await ctx.reply(`📝 **Change Bio for Card**\n\n` +
+            `**Card:** ${card.name}\n` +
+            `**Current Bio:** ${card.bio || 'No bio set'}\n\n` +
+            `Please send the new bio for this card:`, { ...getReplyParams(ctx), parse_mode: 'HTML' });
+    }
+    catch (e) {
+        await ctx.reply('Failed to start bio change: ' + (e.message || e), { ...getReplyParams(ctx) });
+    }
+});
+// Command to change card country
+bot.command('changecountry', async (ctx) => {
+    const admin = await ensureUser(prisma, ctx.from);
+    if (!await isAdmin({ id: admin.id })) {
+        return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+    }
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const cardId = Number(parts[1]);
+    const newCountry = parts.slice(2).join(' ').trim();
+    if (!cardId || !newCountry) {
+        return ctx.reply('Usage: /changecountry <cardId> <new_country>\n\nExample: /changecountry 123 India', { ...getReplyParams(ctx) });
+    }
+    try {
+        const card = await prisma.card.findUnique({ where: { id: cardId } });
+        if (!card) {
+            return ctx.reply('Card not found.', { ...getReplyParams(ctx) });
+        }
+        const updatedCard = await prisma.card.update({
+            where: { id: cardId },
+            data: { country: newCountry }
+        });
+        await ctx.reply(`🌍 **Country Changed Successfully!**\n\n` +
+            `**Card:** ${updatedCard.name}\n` +
+            `**Old Country:** ${card.country}\n` +
+            `**New Country:** ${newCountry}\n` +
+            `**Card ID:** ${cardId}`, { ...getReplyParams(ctx), parse_mode: 'HTML' });
+    }
+    catch (e) {
+        await ctx.reply('Failed to change country: ' + (e.message || e), { ...getReplyParams(ctx) });
     }
 });
 bot.command('cards', async (ctx) => {
@@ -1949,7 +2477,6 @@ async function sendCardDetails(ctx, card, chatId, prefix, showTopCollectors) {
             try {
                 await ctx.telegram.sendPhoto(chatId || ctx.chat.id, { source: buffer, filename: 'card.jpg' }, {
                     caption: cardDetails,
-                    parse_mode: 'HTML',
                     ...getReplyParams(ctx)
                 });
                 return true;
@@ -1962,7 +2489,6 @@ async function sendCardDetails(ctx, card, chatId, prefix, showTopCollectors) {
                     fs.writeFileSync(tempPath, buffer);
                     await ctx.telegram.sendPhoto(chatId || ctx.chat.id, { source: fs.createReadStream(tempPath) }, {
                         caption: cardDetails,
-                        parse_mode: 'HTML',
                         ...getReplyParams(ctx)
                     });
                     fs.unlinkSync(tempPath);
@@ -2274,7 +2800,6 @@ bot.command('fav', async (ctx) => {
         if (favoriteCard.imageUrl && favoriteCard.imageUrl.startsWith('http')) {
             await ctx.replyWithPhoto(favoriteCard.imageUrl, {
                 caption: cardDetails,
-                parse_mode: 'HTML',
                 ...getReplyParams(ctx)
             });
         }
@@ -2384,116 +2909,610 @@ async function handleTopCollectors(ctx) {
 }
 // Updated Callback query handler to show complete card details
 bot.on("callback_query", async (ctx, next) => {
-    if ('data' in ctx.callbackQuery) {
-        const data = ctx.callbackQuery.data;
-        if (data === "check_card") {
-            const userId = ctx.callbackQuery.from.id;
-            let cardFound = false;
-            // Iterate over active card drops to find an uncollected card
-            for (const [chatId, card] of activeCardDrops.entries()) {
-                if (!card.collected) {
-                    cardFound = await sendCardDetails(ctx, card, chatId);
-                    break;
+    try {
+        if ('data' in ctx.callbackQuery) {
+            const data = ctx.callbackQuery.data;
+            if (data === "check_card") {
+                const userId = ctx.callbackQuery.from.id;
+                let cardFound = false;
+                // Iterate over active card drops to find an uncollected card
+                for (const [chatId, card] of activeCardDrops.entries()) {
+                    if (!card.collected) {
+                        cardFound = await sendCardDetails(ctx, card, chatId);
+                        break;
+                    }
+                }
+                if (!cardFound) {
+                    await ctx.answerCbQuery("No active card drop available.");
+                }
+                else {
+                    await ctx.answerCbQuery("Card details sent in chat!");
                 }
             }
-            if (!cardFound) {
-                await ctx.answerCbQuery("No active card drop available.");
+            else if (data === "fuse_cancel") {
+                await ctx.answerCbQuery("Fuse cancelled.");
+                await ctx.editMessageText("❌ Fuse operation cancelled.");
+            }
+            else if (data.startsWith("fuse_confirm_card_")) {
+                await handleFuseConfirmCard(ctx);
+            }
+            else if (data.startsWith("fuse_confirm_rarity_")) {
+                await handleFuseConfirmRarity(ctx);
+            }
+            else if (data.startsWith("top_collectors_")) {
+                await handleTopCollectors(ctx);
             }
             else {
-                await ctx.answerCbQuery("Card details sent in chat!");
+                return next();
             }
-        }
-        else if (data === "fuse_cancel") {
-            await ctx.answerCbQuery("Fuse cancelled.");
-            await ctx.editMessageText("❌ Fuse operation cancelled.");
-        }
-        else if (data.startsWith("fuse_confirm_card_")) {
-            await handleFuseConfirmCard(ctx);
-        }
-        else if (data.startsWith("fuse_confirm_rarity_")) {
-            await handleFuseConfirmRarity(ctx);
-        }
-        else if (data.startsWith("top_collectors_")) {
-            await handleTopCollectors(ctx);
         }
         else {
             return next();
         }
     }
-    else {
-        return next();
+    catch (error) {
+        console.error('Error in callback query handler:', error);
+        try {
+            await ctx.answerCbQuery('❌ An error occurred. Please try again.');
+        }
+        catch (answerError) {
+            console.error('Failed to answer callback query:', answerError);
+        }
+    }
+});
+// Search callback handlers
+bot.action('search_popular', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        // Show popular cards
+        const popularCards = await prisma.card.findMany({
+            take: 10,
+            orderBy: { createdAt: 'desc' }
+        });
+        let resultMessage = `🔍 **Popular Players**\n\n`;
+        resultMessage += `Here are some popular cards:\n\n`;
+        popularCards.forEach((card, index) => {
+            resultMessage += `${index + 1}. **${card.name}**\n`;
+            resultMessage += `   ${getRarityWithEmoji(card.rarity)} ${card.rarity} • ${card.country} ${getCountryFlag(card.country)}\n`;
+            resultMessage += `   ID: ${card.id} • Role: ${card.role}\n\n`;
+        });
+        resultMessage += `━━━━━━━━━━━━━━━━━━\n`;
+        resultMessage += `💡 Use /check <card_id> for more details\n`;
+        resultMessage += `💡 Use /search <player_name> to search for specific players`;
+        await ctx.editMessageText(resultMessage, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔍 Search Popular Players', callback_data: 'search_popular' }],
+                    [{ text: '📋 View All Cards', callback_data: 'view_all_cards' }],
+                    [{ text: '❓ Help', callback_data: 'search_help' }]
+                ]
+            }
+        });
+    }
+    catch (error) {
+        console.error('Error in search_popular callback:', error);
+        await ctx.answerCbQuery('❌ An error occurred. Please try again.');
+    }
+});
+bot.action('view_all_cards', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        // Redirect to allcards command
+        const allCards = await prisma.card.findMany({
+            take: 15,
+            orderBy: [
+                { rarity: 'asc' },
+                { name: 'asc' }
+            ]
+        });
+        let resultMessage = `📋 **All Cards (Sample)**\n\n`;
+        resultMessage += `Showing ${allCards.length} cards:\n\n`;
+        allCards.forEach((card, index) => {
+            resultMessage += `${index + 1}. **${card.name}**\n`;
+            resultMessage += `   ${getRarityWithEmoji(card.rarity)} ${card.rarity} • ${card.country} ${getCountryFlag(card.country)}\n`;
+            resultMessage += `   ID: ${card.id} • Role: ${card.role}\n\n`;
+        });
+        resultMessage += `━━━━━━━━━━━━━━━━━━\n`;
+        resultMessage += `💡 Use /allcards for complete list\n`;
+        resultMessage += `💡 Use /check <card_id> for more details`;
+        await ctx.editMessageText(resultMessage, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔍 Search Popular Players', callback_data: 'search_popular' }],
+                    [{ text: '📋 View All Cards', callback_data: 'view_all_cards' }],
+                    [{ text: '❓ Help', callback_data: 'search_help' }]
+                ]
+            }
+        });
+    }
+    catch (error) {
+        console.error('Error in view_all_cards callback:', error);
+        await ctx.answerCbQuery('❌ An error occurred. Please try again.');
+    }
+});
+bot.action('search_help', async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const helpMessage = `❓ **Search Help**\n\n` +
+            `**How to search for cards:**\n\n` +
+            `1. **Direct Search:**\n` +
+            `   • Type \`/search <player_name>\`\n` +
+            `   • Example: \`/search virat\` or \`/search rohit\`\n\n` +
+            `2. **View All Cards:**\n` +
+            `   • Use \`/allcards\` to see all available cards\n` +
+            `   • Use \`/cards rarity\` to filter by rarity\n\n` +
+            `3. **Check Card Details:**\n` +
+            `   • Use \`/check <card_id>\` for detailed information\n\n` +
+            `**Search Tips:**\n` +
+            `• Use partial names (e.g., "Rohit" instead of "Rohit Sharma")\n` +
+            `• Search is case-insensitive\n` +
+            `• Try different spellings if no results found\n\n` +
+            `**Available Rarities:**\n` +
+            `• ${getRarityWithEmoji('COMMON')} Common\n` +
+            `• ${getRarityWithEmoji('RARE')} Rare\n` +
+            `• ${getRarityWithEmoji('LEGENDARY')} Legendary\n` +
+            `• ${getRarityWithEmoji('LIMITED_EDITION')} Limited Edition\n` +
+            `• ${getRarityWithEmoji('COSMIC')} Cosmic\n` +
+            `• ${getRarityWithEmoji('PREMIUM')} Premium`;
+        await ctx.editMessageText(helpMessage, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔍 Search Popular Players', callback_data: 'search_popular' }],
+                    [{ text: '📋 View All Cards', callback_data: 'view_all_cards' }],
+                    [{ text: '❓ Help', callback_data: 'search_help' }]
+                ]
+            }
+        });
+    }
+    catch (error) {
+        console.error('Error in search_help callback:', error);
+        await ctx.answerCbQuery('❌ An error occurred. Please try again.');
+    }
+});
+// Inline query handler for card search
+bot.on('inline_query', async (ctx) => {
+    try {
+        const query = ctx.inlineQuery.query.trim().toLowerCase();
+        if (!query || query.length < 2) {
+            // If no query or too short, show some popular cards
+            const popularCards = await prisma.card.findMany({
+                take: 10,
+                orderBy: { createdAt: 'desc' }
+            });
+            const results = popularCards.map(card => ({
+                type: 'article',
+                id: `card_${card.id}`,
+                title: card.name,
+                description: `${getRarityWithEmoji(card.rarity)} ${card.rarity} • ${card.country} • ${card.role}`,
+                thumb_url: card.imageUrl || undefined,
+                input_message_content: {
+                    message_text: `🔍 **Search Result**\n\n` +
+                        `**Name:** ${card.name}\n` +
+                        `**Rarity:** ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+                        `**Country:** ${card.country} ${getCountryFlag(card.country)}\n` +
+                        `**ID:** ${card.id}\n` +
+                        `**Role:** ${card.role}${card.bio ? `\n**Bio:** ${card.bio}` : ''}\n\n` +
+                        `━━━━━━━━━━━━━━━━━━\n` +
+                        `💡 **Click the button below to see the full card with image!**`,
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '🖼️ View Full Card', callback_data: `show_card_${card.id}` }]
+                        ]
+                    }
+                }
+            }));
+            await ctx.answerInlineQuery(results, { cache_time: 300 });
+            return;
+        }
+        // Search for cards containing the query in name (case-insensitive)
+        const searchResults = await prisma.card.findMany({
+            where: {
+                name: {
+                    contains: query
+                }
+            },
+            take: 20,
+            orderBy: [
+                { rarity: 'asc' },
+                { name: 'asc' }
+            ]
+        });
+        if (searchResults.length === 0) {
+            await ctx.answerInlineQuery([{
+                    type: 'article',
+                    id: 'no_results',
+                    title: 'No cards found',
+                    description: `No cards found for "${query}"`,
+                    input_message_content: {
+                        message_text: `🔍 Search Results\n\n` +
+                            `❌ No cards found for "${query}"\n\n` +
+                            `💡 Search Tips:\n` +
+                            `• Try different spellings\n` +
+                            `• Use partial names (e.g., "Rohit" instead of "Rohit Sharma")\n` +
+                            `• Check /allcards to see all available cards`,
+                    }
+                }], { cache_time: 300 });
+            return;
+        }
+        const results = searchResults.map(card => ({
+            type: 'article',
+            id: `card_${card.id}`,
+            title: card.name,
+            description: `${getRarityWithEmoji(card.rarity)} ${card.rarity} • ${card.country} • ${card.role}`,
+            thumb_url: card.imageUrl || undefined,
+            input_message_content: {
+                message_text: `🔍 **Search Result**\n\n` +
+                    `**Name:** ${card.name}\n` +
+                    `**Rarity:** ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+                    `**Country:** ${card.country} ${getCountryFlag(card.country)}\n` +
+                    `**ID:** ${card.id}\n` +
+                    `**Role:** ${card.role}${card.bio ? `\n**Bio:** ${card.bio}` : ''}\n\n` +
+                    `━━━━━━━━━━━━━━━━━━\n` +
+                    `💡 **Click the button below to see the full card with image!**`,
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🖼️ View Full Card', callback_data: `show_card_${card.id}` }]
+                    ]
+                }
+            }
+        }));
+        await ctx.answerInlineQuery(results, {
+            cache_time: 300,
+            is_personal: false
+        });
+    }
+    catch (error) {
+        console.error('Error in inline query:', error);
+        try {
+            await ctx.answerInlineQuery([{
+                    type: 'article',
+                    id: 'error',
+                    title: 'Search Error',
+                    description: 'An error occurred while searching',
+                    input_message_content: {
+                        message_text: '❌ An error occurred while searching for cards. Please try again.',
+                    }
+                }], { cache_time: 10 });
+        }
+        catch (answerError) {
+            console.error('Failed to answer inline query:', answerError);
+        }
+    }
+});
+// Handler for showing full card from search results
+bot.action(/^show_card_(\d+)$/, async (ctx) => {
+    try {
+        await ctx.answerCbQuery();
+        const cardId = parseInt(ctx.match[1]);
+        // Get the card details
+        const card = await prisma.card.findUnique({
+            where: { id: cardId }
+        });
+        if (!card) {
+            await ctx.editMessageText('❌ Card not found.');
+            return;
+        }
+        // Send the full card with image using the existing sendCardDetails function
+        await sendCardDetails(ctx, card, undefined, '🔍 **Search Result - Full Card**');
+    }
+    catch (error) {
+        console.error('Error in show_card callback:', error);
+        try {
+            await ctx.answerCbQuery('❌ An error occurred. Please try again.');
+        }
+        catch (answerError) {
+            console.error('Failed to answer callback query:', answerError);
+        }
     }
 });
 // Handler for collecting the card in group chat when a user types the card name
 bot.on("text", async (ctx, next) => {
-    if (ctx.chat && ctx.chat.type !== 'private' && ctx.from) {
-        const chatId = ctx.chat.id;
-        const activeCard = activeCardDrops.get(chatId);
-        if (activeCard && !activeCard.collected) {
-            // Split the card name and user's message into words
-            const cardNameParts = activeCard.name.toLowerCase().split(/\s+/);
-            const userMessageParts = ctx.message.text.trim().toLowerCase().split(/\s+/);
-            // Check if any part of the user's message matches any part of the card name
-            const isMatch = userMessageParts.some(msgPart => 
-            // Check if this part matches the full card name
-            activeCard.name.toLowerCase() === msgPart ||
-                // Or if it matches any part of the card name
-                cardNameParts.some(namePart => namePart === msgPart));
-            if (isMatch) {
-                // Add card to user's collection
-                const user = await ensureUser(prisma, ctx.from);
+    try {
+        // Handle bio change for admins
+        if (ctx.from) {
+            const admin = await ensureUser(prisma, ctx.from);
+            if (await isAdmin({ id: admin.id }) && pendingBioChanges.has(admin.id)) {
+                const cardId = pendingBioChanges.get(admin.id);
+                const newBio = ctx.message.text;
                 try {
-                    // Use transaction to ensure atomicity
-                    await prisma.$transaction(async (tx) => {
-                        // Check if user already has this card
-                        const existing = await tx.ownership.findUnique({
-                            where: {
-                                userId_cardId: {
-                                    userId: user.id,
-                                    cardId: activeCard.id
-                                }
-                            }
-                        });
-                        if (existing) {
-                            // Increment quantity if user already has the card
-                            await tx.ownership.update({
-                                where: { id: existing.id },
-                                data: { quantity: existing.quantity + 1 }
-                            });
-                        }
-                        else {
-                            // Create new ownership if user doesn't have the card
-                            await tx.ownership.create({
-                                data: {
-                                    userId: user.id,
-                                    cardId: activeCard.id,
-                                    quantity: 1
-                                }
-                            });
-                        }
-                        // Increment totalCardsCollected for the user
-                        await tx.user.update({
-                            where: { id: user.id },
-                            data: { totalCardsCollected: { increment: 1 } }
-                        });
+                    const updatedCard = await prisma.card.update({
+                        where: { id: cardId },
+                        data: { bio: newBio }
                     });
-                    activeCard.collected = true;
-                    activeCardDrops.set(chatId, activeCard);
-                    const message = `✪ You Collected A ${activeCard.rarity} !!\n\n${activeCard.name}\n➥ ${activeCard.country}\n\nTake A Look At Your Collection Using /cards`;
-                    await ctx.reply(message, { ...getReplyParams(ctx) });
+                    // Clear the pending change
+                    pendingBioChanges.delete(admin.id);
+                    await ctx.reply(`📝 **Bio Changed Successfully!**\n\n` +
+                        `**Card:** ${updatedCard.name}\n` +
+                        `**New Bio:** ${newBio}\n` +
+                        `**Card ID:** ${cardId}`, { ...getReplyParams(ctx), parse_mode: 'HTML' });
+                    return;
                 }
-                catch (error) {
-                    console.error('Error adding card to collection:', error);
-                    await ctx.reply('Error adding card to your collection.');
+                catch (e) {
+                    pendingBioChanges.delete(admin.id);
+                    await ctx.reply('Failed to change bio: ' + (e.message || e), { ...getReplyParams(ctx) });
+                    return;
+                }
+            }
+            // Handle addcard wizard for admins
+            if (await isAdmin({ id: admin.id }) && addCardStates.has(admin.id)) {
+                const state = addCardStates.get(admin.id);
+                const input = ctx.message.text;
+                try {
+                    if (state.step === 'name') {
+                        state.card.name = input;
+                        state.step = 'rarity';
+                        const keyboard = {
+                            inline_keyboard: [
+                                [
+                                    { text: '🥉 Common', callback_data: 'addcard_rarity_COMMON' },
+                                    { text: '🥈 Medium', callback_data: 'addcard_rarity_MEDIUM' }
+                                ],
+                                [
+                                    { text: '🥇 Rare', callback_data: 'addcard_rarity_RARE' },
+                                    { text: '🟡 Legendary', callback_data: 'addcard_rarity_LEGENDARY' }
+                                ],
+                                [
+                                    { text: '💮 Exclusive', callback_data: 'addcard_rarity_EXCLUSIVE' },
+                                    { text: '🔮 Limited Edition', callback_data: 'addcard_rarity_LIMITED_EDITION' }
+                                ],
+                                [
+                                    { text: '💠 Cosmic', callback_data: 'addcard_rarity_COSMIC' },
+                                    { text: '♠️ Prime', callback_data: 'addcard_rarity_PRIME' }
+                                ],
+                                [
+                                    { text: '🧿 Premium', callback_data: 'addcard_rarity_PREMIUM' }
+                                ]
+                            ]
+                        };
+                        await ctx.reply(`✅ Name set: ${input}\n\n` +
+                            `Step 2/6: Select card rarity:`, { ...getReplyParams(ctx), reply_markup: keyboard });
+                        return;
+                    }
+                    else if (state.step === 'country') {
+                        state.card.country = input;
+                        state.step = 'role';
+                        await ctx.reply(`✅ Country set: ${input}\n\n` +
+                            `Step 4/6: Enter the player role:\n\n` +
+                            `Example: Batsman, Bowler, All-rounder, Wicket-keeper`, { ...getReplyParams(ctx) });
+                        return;
+                    }
+                    else if (state.step === 'role') {
+                        state.card.role = input;
+                        state.step = 'bio';
+                        await ctx.reply(`✅ Role set: ${input}\n\n` +
+                            `Step 5/6: Enter the player bio (or type "skip"):\n\n` +
+                            `Example: Legendary Indian cricketer and former captain`, { ...getReplyParams(ctx) });
+                        return;
+                    }
+                    else if (state.step === 'bio') {
+                        state.card.bio = input === 'skip' ? null : input;
+                        state.step = 'image';
+                        await ctx.reply(`✅ Bio set: ${input === 'skip' ? 'None' : input}\n\n` +
+                            `Step 6/6: Enter the image URL (or type "skip"):\n\n` +
+                            `Example: https://example.com/image.jpg`, { ...getReplyParams(ctx) });
+                        return;
+                    }
+                    else if (state.step === 'image') {
+                        state.card.imageUrl = input === 'skip' ? null : input;
+                        // Create the card
+                        try {
+                            const nextId = await getNextCardId(prisma);
+                            state.card.id = nextId;
+                            const card = await prisma.card.create({ data: state.card });
+                            // Clear the wizard state
+                            addCardStates.delete(admin.id);
+                            const cardDetails = `✅ Card Created Successfully!\n\n` +
+                                `Card ID: ${card.id}\n` +
+                                `Name: ${card.name}\n` +
+                                `Rarity: ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+                                `Country: ${card.country}\n` +
+                                `Role: ${card.role}${card.bio ? `\nBio: ${card.bio}` : ''}`;
+                            await ctx.reply(cardDetails, { ...getReplyParams(ctx) });
+                            return;
+                        }
+                        catch (e) {
+                            addCardStates.delete(admin.id);
+                            await ctx.reply(`❌ Failed to create card: ${e.message}`, { ...getReplyParams(ctx) });
+                            return;
+                        }
+                    }
+                }
+                catch (e) {
+                    addCardStates.delete(admin.id);
+                    await ctx.reply(`❌ An error occurred: ${e.message}`, { ...getReplyParams(ctx) });
+                    return;
                 }
             }
         }
+        if (ctx.chat && ctx.chat.type !== 'private' && ctx.from) {
+            const chatId = ctx.chat.id;
+            const activeCard = activeCardDrops.get(chatId);
+            if (activeCard && !activeCard.collected) {
+                // Split the card name and user's message into words
+                const cardNameParts = activeCard.name.toLowerCase().split(/\s+/);
+                const userMessageParts = ctx.message.text.trim().toLowerCase().split(/\s+/);
+                // Check if any part of the user's message matches any part of the card name
+                const isMatch = userMessageParts.some(msgPart => 
+                // Check if this part matches the full card name
+                activeCard.name.toLowerCase() === msgPart ||
+                    // Or if it matches any part of the card name
+                    cardNameParts.some(namePart => namePart === msgPart));
+                if (isMatch) {
+                    // Add card to user's collection
+                    const user = await ensureUser(prisma, ctx.from);
+                    try {
+                        // Use transaction to ensure atomicity
+                        await prisma.$transaction(async (tx) => {
+                            // Check if user already has this card
+                            const existing = await tx.ownership.findUnique({
+                                where: {
+                                    userId_cardId: {
+                                        userId: user.id,
+                                        cardId: activeCard.id
+                                    }
+                                }
+                            });
+                            if (existing) {
+                                // Increment quantity if user already has the card
+                                await tx.ownership.update({
+                                    where: { id: existing.id },
+                                    data: { quantity: existing.quantity + 1 }
+                                });
+                            }
+                            else {
+                                // Create new ownership if user doesn't have the card
+                                await tx.ownership.create({
+                                    data: {
+                                        userId: user.id,
+                                        cardId: activeCard.id,
+                                        quantity: 1
+                                    }
+                                });
+                            }
+                            // Increment totalCardsCollected for the user
+                            await tx.user.update({
+                                where: { id: user.id },
+                                data: { totalCardsCollected: { increment: 1 } }
+                            });
+                        });
+                        activeCard.collected = true;
+                        activeCardDrops.set(chatId, activeCard);
+                        // Get user name for the collection message
+                        const userName = user.firstName || user.username || 'User';
+                        // Send the enhanced collection message with image and emojis
+                        await sendCardCollectionMessage(ctx, activeCard, userName);
+                    }
+                    catch (error) {
+                        console.error('Error adding card to collection:', error);
+                        await ctx.reply('Error adding card to your collection.');
+                    }
+                }
+            }
+        }
+        return next();
     }
-    return next();
+    catch (error) {
+        console.error('Error in text handler:', error);
+        try {
+            await ctx.reply('❌ An error occurred while processing your message. Please try again.');
+        }
+        catch (replyError) {
+            console.error('Failed to send error reply in text handler:', replyError);
+        }
+    }
 });
 // Helper to always get reply_parameters for a ctx
 function getReplyParams(ctx) {
     return ctx.message?.message_id ? { reply_parameters: { message_id: ctx.message.message_id } } : {};
+}
+// Helper function to get country flag emoji
+function getCountryFlag(country) {
+    const flagMap = {
+        'India': '🇮🇳',
+        'Australia': '🇦🇺',
+        'England': '🇬🇧',
+        'Pakistan': '🇵🇰',
+        'South Africa': '🇿🇦',
+        'New Zealand': '🇳🇿',
+        'West Indies': '🇯🇲',
+        'Sri Lanka': '🇱🇰',
+        'Bangladesh': '🇧🇩',
+        'Afghanistan': '🇦🇫',
+        'Ireland': '🇮🇪',
+        'Scotland': '🏴󠁧󠁢󠁳󠁣󠁴󠁿',
+        'Netherlands': '🇳🇱',
+        'Zimbabwe': '🇿🇼',
+        'USA': '🇺🇸',
+        'Canada': '🇨🇦',
+        'UAE': '🇦🇪',
+        'Oman': '🇴🇲',
+        'Nepal': '🇳🇵',
+        'Hong Kong': '🇭🇰',
+        'Singapore': '🇸🇬',
+        'Malaysia': '🇲🇾',
+        'Thailand': '🇹🇭',
+        'Japan': '🇯🇵',
+        'China': '🇨🇳',
+        'Korea': '🇰🇷',
+        'Germany': '🇩🇪',
+        'France': '🇫🇷',
+        'Italy': '🇮🇹',
+        'Spain': '🇪🇸',
+        'Brazil': '🇧🇷',
+        'Argentina': '🇦🇷',
+        'Mexico': '🇲🇽',
+        'Kenya': '🇰🇪',
+        'Uganda': '🇺🇬',
+        'Tanzania': '🇹🇿',
+        'Namibia': '🇳🇦',
+        'Botswana': '🇧🇼',
+        'Rwanda': '🇷🇼',
+        'Ghana': '🇬🇭',
+        'Nigeria': '🇳🇬',
+        'Egypt': '🇪🇬',
+        'Morocco': '🇲🇦',
+        'Tunisia': '🇹🇳',
+        'Algeria': '🇩🇿',
+        'Libya': '🇱🇾',
+        'Sudan': '🇸🇩',
+        'Ethiopia': '🇪🇹',
+        'Somalia': '🇸🇴',
+        'Djibouti': '🇩🇯',
+        'Eritrea': '🇪🇷',
+        'Somaliland': '🇸🇴',
+        'Puntland': '🇸🇴',
+        'Galmudug': '🇸🇴',
+        'Hirshabelle': '🇸🇴',
+        'South West': '🇸🇴',
+        'Jubaland': '🇸🇴'
+    };
+    return flagMap[country] || '🏳️';
+}
+// Function to send card collection message with image and emojis
+async function sendCardCollectionMessage(ctx, card, userName) {
+    try {
+        const rarityEmoji = getRarityWithEmoji(card.rarity);
+        const countryFlag = getCountryFlag(card.country);
+        // Create the collection message with emojis and formatting
+        const caption = `🏆 <b>${userName.toUpperCase()}</b> 😲, you've collected a new <b>Card!</b>\n\n` +
+            `👤 <b>Name:</b> ${card.name}\n` +
+            `💎<b>Rarity:</b> ${rarityEmoji} \n` +
+            `🤝 <b>TEAM:</b> ${card.country} \n\n` +
+            `🧭 <b>Take A Look At Your Collection Using /</b>cards`;
+        // Send photo with caption
+        if (card.imageUrl) {
+            await ctx.replyWithPhoto(card.imageUrl, {
+                caption: caption,
+                parse_mode: 'HTML',
+                ...getReplyParams(ctx)
+            });
+        }
+        else {
+            // Fallback to text message if no image
+            await ctx.reply(caption, {
+                parse_mode: 'HTML',
+                ...getReplyParams(ctx)
+            });
+        }
+    }
+    catch (error) {
+        console.error('Error sending card collection message:', error);
+        // Fallback to simple text message
+        const fallbackMessage = `🏆 <b>${userName.toUpperCase()}</b> 😲, you've collected a new <b>CRICKETERS!</b>\n\n` +
+            `👤 <b>Name:</b> ${card.name}\n` +
+            `${getRarityWithEmoji(card.rarity)} <b>Rarity:</b> ${card.rarity}\n` +
+            `🤝 <b>TEAM:</b> ${card.country} ${getCountryFlag(card.country)}\n\n` +
+            `🧭 <b>Take A Look At Your Collection Using /</b>cards`;
+        await ctx.reply(fallbackMessage, {
+            parse_mode: 'HTML',
+            ...getReplyParams(ctx)
+        });
+    }
 }
 // Insert Group Command Admin Middleware
 bot.use(async (ctx, next) => {

@@ -1,0 +1,19 @@
+[Unit]
+Description=Cricket Heritage Bot
+After=network.target
+
+[Service]
+Type=forking
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/deploy-production-20251016_193509
+ExecStart=/home/ubuntu/deploy-production-20251016_193509/scripts/bot-manager.sh start
+ExecStop=/home/ubuntu/deploy-production-20251016_193509/scripts/bot-manager.sh stop
+ExecReload=/home/ubuntu/deploy-production-20251016_193509/scripts/bot-manager.sh restart
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
