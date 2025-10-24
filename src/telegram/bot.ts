@@ -8,11 +8,8 @@ import { ensureUser, openPackForUser, listUserCards, claimDaily, getLeaderboard 
 import { createTrade, acceptTrade, rejectTrade, myTrades } from '../services/trade.js';
 import { browseMarket, listForSale, buyFromMarket, cancelListing } from '../services/market.js';
 
-async function isAdmin(user: { id: number }): Promise<boolean> {
-  const dbUser = await prisma.user.findUnique({
-    where: { id: user.id }
-  });
-  return (dbUser as any)?.isAdmin || false;
+async function isAdmin(user: { isAdmin: boolean }): Promise<boolean> {
+  return user.isAdmin || false;
 }
 
 // Helper function to get the next available card ID
@@ -139,6 +136,52 @@ if (!token) {
 
 const prisma = new PrismaClient();
 const bot = new Telegraf(token);
+
+// Spam detection system variables
+const messageCounts = new Map<number, { count: number; lastReset: number }>(); // userId -> { count, lastReset }
+const tempBannedUsers = new Map<number, number>(); // userId -> banEndTime
+let spamLimit = 5; // Default: 5 messages in 2 seconds
+
+// Ban check middleware - must be BEFORE all command handlers
+bot.use(async (ctx, next) => {
+  if (ctx.from && ctx.message && 'text' in ctx.message && typeof ctx.message.text === 'string' && ctx.message.text.startsWith('/')) {
+    const userId = ctx.from.id;
+    const now = Date.now();
+    const command = ctx.message.text.split(' ')[0];
+    
+    // Check for temporary spam ban
+    if (tempBannedUsers.has(userId)) {
+      const banEndTime = tempBannedUsers.get(userId)!;
+      if (now < banEndTime) {
+        // User is temporarily banned from spam
+        if (command !== '/profile' && !command.startsWith('/profile@')) {
+          await ctx.reply('🚫 You are temporarily banned for 2 minutes due to spam. Only /profile command is available.', {
+            ...getReplyParams(ctx)
+          });
+          return;
+        }
+      } else {
+        // Ban expired, remove from temp banned list
+        tempBannedUsers.delete(userId);
+      }
+    }
+    
+    // Check for permanent ban (isBanned field)
+    try {
+      const user = await ensureUser(prisma, ctx.from);
+      if (user.isBanned && command !== '/profile' && !command.startsWith('/profile@')) {
+        await ctx.reply('🚫 You are banned from using this bot. Only /profile command is available.', {
+          ...getReplyParams(ctx)
+        });
+        return;
+      }
+    } catch (error) {
+      console.error('Error in ban check middleware:', error);
+    }
+  }
+  return next();
+});
+
 export { bot, prisma }
 
 // Do not need separate action handlers as we'll handle them in the wizard
@@ -403,7 +446,7 @@ const addCardWizard = new Scenes.WizardScene<MyWizardContext>(
 bot.command('addcard', async (ctx) => {
   try {
   const user = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: user.id })) {
+  if (!await isAdmin(user)) {
     return ctx.reply('Only admins can use this command.');
   }
     
@@ -440,7 +483,7 @@ bot.command('addcard', async (ctx) => {
 bot.command('canceladdcard', async (ctx) => {
   try {
     const user = await ensureUser(prisma, ctx.from);
-    if (!await isAdmin({ id: user.id })) {
+    if (!await isAdmin(user)) {
       return ctx.reply('Only admins can use this command.');
     }
     
@@ -547,7 +590,7 @@ bot.command('search', async (ctx) => {
 // Command to delete a card: /deletecard card_id (admin only)
 bot.command('deletecard', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: user.id })) {
+  if (!await isAdmin(user)) {
     return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
   }
   const parts = (ctx.message.text || '').split(/\s+/);
@@ -617,7 +660,7 @@ bot.command('deletecard', async (ctx) => {
 // Command to reorder card IDs: /reordercards (admin only)
 bot.command('reordercards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: user.id })) {
+  if (!await isAdmin(user)) {
     return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
   }
   
@@ -633,7 +676,7 @@ bot.command('reordercards', async (ctx) => {
 // Command to change card rarity: /changerarity card_id (admin only)
 bot.command('changerarity', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: user.id })) {
+  if (!await isAdmin(user)) {
     return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
   }
   const parts = (ctx.message.text || '').split(/\s+/);
@@ -684,7 +727,7 @@ bot.command('changerarity', async (ctx) => {
 // Command to give card to user: /daan card_id (admin only, must reply to user's message)
 bot.command('daan', async (ctx) => {
   const admin = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: admin.id })) {
+  if (!await isAdmin(admin)) {
     return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
   }
   
@@ -761,6 +804,130 @@ bot.command('daan', async (ctx) => {
   }
 });
 
+// Command to ban a user: /botban username or reply to user with /botban
+bot.command('botban', async (ctx) => {
+  console.log('🔨 /botban command triggered by user:', ctx.from?.id, ctx.from?.username);
+  const admin = await ensureUser(prisma, ctx.from);
+  console.log('🔨 Admin check - isAdmin:', admin.isAdmin);
+  if (!admin.isAdmin) {
+    return ctx.reply('❌ You must be an admin to use this command.', { ...getReplyParams(ctx) });
+  }
+
+  let targetUser;
+  
+  // Check if replying to a message
+  if (ctx.message.reply_to_message && ctx.message.reply_to_message.from) {
+    // Get the user from the database directly
+    targetUser = await prisma.user.findFirst({
+      where: { telegramId: ctx.message.reply_to_message.from.id.toString() }
+    });
+    
+    if (!targetUser) {
+      return ctx.reply('❌ User not found in database.', { ...getReplyParams(ctx) });
+    }
+  } else {
+    // Get username from command arguments
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const username = parts[1];
+    
+    if (!username) {
+      return ctx.reply('❌ Usage: /botban <username> or reply to a user with /botban', { ...getReplyParams(ctx) });
+    }
+    
+    // Find user by username (remove @ if present)
+    const cleanUsername = username.replace('@', '');
+    targetUser = await prisma.user.findFirst({
+      where: { username: cleanUsername }
+    });
+    
+    if (!targetUser) {
+      return ctx.reply('❌ User not found.', { ...getReplyParams(ctx) });
+    }
+  }
+
+  if (targetUser.isAdmin) {
+    return ctx.reply('❌ Cannot ban an admin.', { ...getReplyParams(ctx) });
+  }
+
+  if (targetUser.isBanned) {
+    return ctx.reply('❌ User is already banned.', { ...getReplyParams(ctx) });
+  }
+
+  // Ban the user
+  console.log(`Banning user: ${targetUser.telegramId}, ${targetUser.username}, ${targetUser.firstName}`);
+  await prisma.user.update({
+    where: { id: targetUser.id },
+    data: { isBanned: true }
+  });
+
+  const targetName = targetUser.firstName || targetUser.username || 'User';
+  console.log(`User ${targetName} (ID: ${targetUser.id}) has been banned`);
+  await ctx.reply(`🔨 <b>${targetName}</b> has been banned from the bot.`, {
+    parse_mode: 'HTML',
+    ...getReplyParams(ctx)
+  });
+});
+
+// Command to unban a user: /botunban username or reply to user with /botunban
+bot.command('botunban', async (ctx) => {
+  console.log('✅ /botunban command triggered by user:', ctx.from?.id, ctx.from?.username);
+  const admin = await ensureUser(prisma, ctx.from);
+  console.log('✅ Admin check - isAdmin:', admin.isAdmin);
+  if (!admin.isAdmin) {
+    return ctx.reply('❌ You must be an admin to use this command.', { ...getReplyParams(ctx) });
+  }
+
+  let targetUser;
+  
+  // Check if replying to a message
+  if (ctx.message.reply_to_message && ctx.message.reply_to_message.from) {
+    // Get the user from the database directly
+    targetUser = await prisma.user.findFirst({
+      where: { telegramId: ctx.message.reply_to_message.from.id.toString() }
+    });
+    
+    if (!targetUser) {
+      return ctx.reply('❌ User not found in database.', { ...getReplyParams(ctx) });
+    }
+  } else {
+    // Get username from command arguments
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const username = parts[1];
+    
+    if (!username) {
+      return ctx.reply('❌ Usage: /botunban <username> or reply to a user with /botunban', { ...getReplyParams(ctx) });
+    }
+    
+    // Find user by username (remove @ if present)
+    const cleanUsername = username.replace('@', '');
+    targetUser = await prisma.user.findFirst({
+      where: { username: cleanUsername }
+    });
+    
+    if (!targetUser) {
+      return ctx.reply('❌ User not found.', { ...getReplyParams(ctx) });
+    }
+  }
+
+  if (!targetUser.isBanned) {
+    return ctx.reply('❌ User is not banned.', { ...getReplyParams(ctx) });
+  }
+
+  // Unban the user
+  console.log(`Unbanning user: ${targetUser.telegramId}, ${targetUser.username}, ${targetUser.firstName}`);
+  await prisma.user.update({
+    where: { id: targetUser.id },
+    data: { isBanned: false }
+  });
+
+  const targetName = targetUser.firstName || targetUser.username || 'User';
+  console.log(`User ${targetName} (ID: ${targetUser.id}) has been unbanned`);
+  await ctx.reply(`✅ <b>${targetName}</b> has been unbanned from the bot.`, {
+    parse_mode: 'HTML',
+    ...getReplyParams(ctx)
+  });
+});
+
 // Command to check card details: /check card_id
 bot.command('check', async (ctx) => {
   const parts = (ctx.message.text || '').split(/\s+/);
@@ -773,6 +940,154 @@ bot.command('check', async (ctx) => {
   } catch (e: any) {
     await ctx.reply('Error fetching card details.', { ...getReplyParams(ctx) });
   }
+});
+
+// Command to ban a user: /botban username or reply to user with /botban
+bot.command('botban', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!admin.isAdmin) {
+    return ctx.reply('❌ You must be an admin to use this command.', { ...getReplyParams(ctx) });
+  }
+
+  let targetUser;
+  
+  // Check if replying to a message
+  if (ctx.message.reply_to_message && ctx.message.reply_to_message.from) {
+    targetUser = await ensureUser(prisma, ctx.message.reply_to_message.from);
+  } else {
+    // Try to get username from command
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const username = parts[1];
+    
+    if (!username) {
+      return ctx.reply('❌ Usage: /botban <username> or reply to a user with /botban', { ...getReplyParams(ctx) });
+    }
+    
+    // Find user by username
+    targetUser = await prisma.user.findFirst({
+      where: { username: username.replace('@', '') }
+    });
+    
+    if (!targetUser) {
+      return ctx.reply('❌ User not found.', { ...getReplyParams(ctx) });
+    }
+  }
+
+  // Check if user is already banned
+  if (targetUser.isBanned) {
+    return ctx.reply('❌ User is already banned.', { ...getReplyParams(ctx) });
+  }
+
+  // Ban the user
+  await prisma.user.update({
+    where: { id: targetUser.id },
+    data: { isBanned: true }
+  });
+
+  const targetName = targetUser.firstName || targetUser.username || 'User';
+  await ctx.reply(`🔨 <b>User Banned</b>\n\nUser: ${targetName}\nStatus: Banned from bot access`, {
+    parse_mode: 'HTML',
+    ...getReplyParams(ctx)
+  });
+});
+
+// Command to unban a user: /botunban username or reply to user with /botunban
+bot.command('botunban', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!admin.isAdmin) {
+    return ctx.reply('❌ You must be an admin to use this command.', { ...getReplyParams(ctx) });
+  }
+
+  let targetUser;
+  
+  // Check if replying to a message
+  if (ctx.message.reply_to_message && ctx.message.reply_to_message.from) {
+    targetUser = await ensureUser(prisma, ctx.message.reply_to_message.from);
+  } else {
+    // Try to get username from command
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const username = parts[1];
+    
+    if (!username) {
+      return ctx.reply('❌ Usage: /botunban <username> or reply to a user with /botunban', { ...getReplyParams(ctx) });
+    }
+    
+    // Find user by username
+    targetUser = await prisma.user.findFirst({
+      where: { username: username.replace('@', '') }
+    });
+    
+    if (!targetUser) {
+      return ctx.reply('❌ User not found.', { ...getReplyParams(ctx) });
+    }
+  }
+
+  // Check if user is not banned
+  if (!targetUser.isBanned) {
+    return ctx.reply('❌ User is not banned.', { ...getReplyParams(ctx) });
+  }
+
+  // Unban the user
+  await prisma.user.update({
+    where: { id: targetUser.id },
+    data: { isBanned: false }
+  });
+
+  const targetName = targetUser.firstName || targetUser.username || 'User';
+  await ctx.reply(`✅ <b>User Unbanned</b>\n\nUser: ${targetName}\nStatus: Bot access restored`, {
+    parse_mode: 'HTML',
+    ...getReplyParams(ctx)
+  });
+});
+
+// Command to remove temporary spam ban: /unbantemp username or reply to user with /unbantemp
+bot.command('unbantemp', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!admin.isAdmin) {
+    return ctx.reply('❌ You must be an admin to use this command.', { ...getReplyParams(ctx) });
+  }
+
+  let targetUser;
+  
+  // Check if replying to a message
+  if (ctx.message.reply_to_message && ctx.message.reply_to_message.from) {
+    targetUser = ctx.message.reply_to_message.from;
+  } else {
+    // Try to get username from command
+    const parts = (ctx.message.text || '').split(/\s+/);
+    const username = parts[1];
+    
+    if (!username) {
+      return ctx.reply('❌ Usage: /unbantemp <username> or reply to a user with /unbantemp', { ...getReplyParams(ctx) });
+    }
+    
+    // Find user by username
+    const dbUser = await prisma.user.findFirst({
+      where: { username: username.replace('@', '') }
+    });
+    
+    if (!dbUser) {
+      return ctx.reply('❌ User not found.', { ...getReplyParams(ctx) });
+    }
+    
+    targetUser = { id: dbUser.telegramId };
+  }
+
+  const userId = parseInt(targetUser.id.toString());
+  
+  // Check if user is temporarily banned
+  if (!tempBannedUsers.has(userId)) {
+    return ctx.reply('❌ User is not temporarily banned.', { ...getReplyParams(ctx) });
+  }
+
+  // Remove temporary ban
+  tempBannedUsers.delete(userId);
+  
+  const targetName = ctx.message.reply_to_message?.from?.first_name || ctx.message.reply_to_message?.from?.username || 'User';
+  await ctx.reply(`✅ <b>Temporary Ban Removed</b>\n\nUser: ${targetName}\nStatus: Spam ban lifted`, {
+    parse_mode: 'HTML',
+    ...getReplyParams(ctx)
+  });
 });
 
 // Remove all active listings for a card by the user: /removepmarket card_id
@@ -1607,7 +1922,7 @@ bot.action(/reject_trade:(\d+)/, async (ctx) => {
 // Handle rarity change callback
 bot.action(/^change_rarity_(\d+)_(.+)$/, async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: user.id })) {
+  if (!await isAdmin(user)) {
     await ctx.answerCbQuery('Only admins can change card rarity.');
     return;
   }
@@ -1637,7 +1952,7 @@ bot.action(/^change_rarity_(\d+)_(.+)$/, async (ctx) => {
 bot.action(/^addcard_rarity_(.+)$/, async (ctx) => {
   try {
     const user = await ensureUser(prisma, ctx.from);
-    if (!await isAdmin({ id: user.id })) {
+    if (!await isAdmin(user)) {
       await ctx.answerCbQuery('Only admins can add cards.');
       return;
     }
@@ -1784,10 +2099,28 @@ bot.command('trades', async (ctx) => {
   await ctx.reply(tradeMessages.join('\n'));
 });
 
+// Admin command to set the spam limit (messages per 2 seconds)
+bot.command('limit', async (ctx) => {
+  const user = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin(user)) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
+  
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const limit = Number(parts[1]);
+  
+  if (!limit || limit < 1 || limit > 50) {
+    return ctx.reply('Usage: /limit <number>\nSet the message limit per 2 seconds (1-50). Current limit: ' + spamLimit, { ...getReplyParams(ctx) });
+  }
+  
+  spamLimit = limit;
+  await ctx.reply(`✅ Spam limit set to ${limit} messages per 2 seconds.`, { ...getReplyParams(ctx) });
+});
+
 // Admin command to set the card drop rate for a group
 bot.command('droprate', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: user.id })) {
+  if (!await isAdmin(user)) {
     return ctx.reply('Only admins can use this command.');
   }
 
@@ -1974,10 +2307,10 @@ bot.command('allcards', async (ctx) => {
 
 bot.command('help', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
-  const isUserAdmin = await isAdmin({ id: user.id });
+  const isUserAdmin = await isAdmin(user);
   let helpText = '/start, /help, /profile, /pack, /cards, /allcards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
   if (isUserAdmin) {
-    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changebio - Change card bio\n/changecountry - Change card country\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/droprate <number> - Set messages required for card drop';
+    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changeimage - Change card image\n/changebio - Change card bio\n/changecountry - Change card country\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/botban - Ban a user\n/botunban - Unban a user\n/unbantemp - Remove temporary spam ban\n/limit <number> - Set spam limit (messages per 2 seconds)\n/droprate <number> - Set messages required for card drop';
   }
   await ctx.reply(helpText);
 });
@@ -1985,7 +2318,7 @@ bot.command('help', async (ctx) => {
 // Command to make a user an admin (only existing admins can use this)
 bot.command('makeadmin', async (ctx) => {
   const adminUser = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: adminUser.id })) {
+  if (!await isAdmin(adminUser)) {
     return ctx.reply('Only admins can use this command.');
   }
   
@@ -2039,7 +2372,7 @@ bot.command('makeadmin', async (ctx) => {
 // Command to remove admin rights from a user (only existing admins can use this)
 bot.command('removeadmin', async (ctx) => {
   const adminUser = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: adminUser.id })) {
+  if (!await isAdmin(adminUser)) {
     return ctx.reply('Only admins can use this command.');
   }
   
@@ -2099,6 +2432,7 @@ const addCardStates = new Map<number, {
   card: any;
 }>(); // userId -> wizard state
 
+
 // Cleanup function to remove old pending changes (5 minutes timeout)
 setInterval(() => {
   // This is a simple cleanup - in production you might want to track timestamps
@@ -2116,7 +2450,7 @@ setInterval(() => {
 // Command to change card bio
 bot.command('changebio', async (ctx) => {
   const admin = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: admin.id })) {
+  if (!await isAdmin(admin)) {
     return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
   }
   
@@ -2150,7 +2484,7 @@ bot.command('changebio', async (ctx) => {
 // Command to change card country
 bot.command('changecountry', async (ctx) => {
   const admin = await ensureUser(prisma, ctx.from);
-  if (!await isAdmin({ id: admin.id })) {
+  if (!await isAdmin(admin)) {
     return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
   }
   
@@ -2489,9 +2823,12 @@ bot.command('buypmarket', async (ctx) => {
   }
 });
 
-// Command to change or add image for a card: /changeimage card_id image_link
+// Command to change or add image for a card: /changeimage card_id image_link (admin only)
 bot.command('changeimage', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin(user)) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
   const parts = (ctx.message.text || '').split(/\s+/);
   const cardId = Number(parts[1]);
   const imageUrl = parts[2];
@@ -2672,6 +3009,71 @@ async function getRandomCard(prisma: PrismaClient) {
 // Middleware to count messages in groups and trigger card drop every 10 messages
 bot.on("message", async (ctx, next) => {
   if (ctx.chat && ctx.chat.type !== 'private') { // only in groups
+    // Spam detection system
+    if (ctx.from) {
+      const userId = ctx.from.id;
+      const now = Date.now();
+      
+      // Check if user is temporarily banned
+      if (tempBannedUsers.has(userId)) {
+        const banEndTime = tempBannedUsers.get(userId)!;
+        if (now < banEndTime) {
+          // User is still banned, don't count their message for card drops
+          // But don't delete the message - just skip processing
+          return next();
+        } else {
+          // Ban expired, remove from temp banned list
+          tempBannedUsers.delete(userId);
+        }
+      }
+      
+      // Check if user is admin (admins are exempt from spam detection)
+      try {
+        const user = await ensureUser(prisma, ctx.from);
+        if (user.isAdmin) {
+          // Admin users are exempt from spam detection
+        } else {
+          // Non-admin users: check spam limit
+          const userData = messageCounts.get(userId);
+          const twoSecondsAgo = now - 2000;
+          
+          if (!userData || userData.lastReset < twoSecondsAgo) {
+            // Reset counter for new 2-second window
+            messageCounts.set(userId, { count: 1, lastReset: now });
+          } else {
+            // Increment counter
+            userData.count++;
+            messageCounts.set(userId, userData);
+            
+            // Check if limit exceeded
+            if (userData.count > spamLimit) {
+              // Ban user for 2 minutes
+              const banEndTime = now + (2 * 60 * 1000); // 2 minutes
+              tempBannedUsers.set(userId, banEndTime);
+              
+              // Don't delete the message - just notify about the ban
+              await ctx.reply(`🚫 ${ctx.from.first_name || 'User'} has been temporarily banned for 2 minutes due to spam (${userData.count} messages in 2 seconds).`);
+              return;
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Error in spam detection:', error);
+      }
+    }
+    
+    // Check if the user is banned before counting their message
+    if (ctx.from) {
+      try {
+        const user = await ensureUser(prisma, ctx.from);
+        if (user.isBanned) {
+          return next(); // Don't count messages from banned users
+        }
+      } catch (error) {
+        console.error('Error checking user ban status:', error);
+      }
+    }
+    
     const chatId = ctx.chat.id;
     let count = groupMessageCount.get(chatId) || 0;
     count += 1;
@@ -2791,7 +3193,13 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
   if (typeof card.imageUrl !== 'string' || !card.imageUrl.startsWith('http')) {
     console.error('Invalid imageUrl:', card.imageUrl);
     // Fallback: If no image or image sending failed, send text-only message
-    const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+    const cardDetails = `${prefix ? prefix + '\n\n' : ''}` +
+      `👤<b>Name:</b> ${card.name}\n` +
+      `💮 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+      `🤝<b>ᴛᴇᴀᴍ:</b> ${card.country}\n\n` +
+      `${card.bio ? `ʙɪᴏ: ${card.bio}\n` : ''}` +
+      `ʀᴏʟᴇ: ${card.role}\n\n` +
+      `🆔 <b>ID:</b> ${card.id}`;
     
     // Add Top Collectors button if requested
     const replyMarkup = showTopCollectors ? {
@@ -2809,7 +3217,13 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
   }
 
   try {
-    const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+    const cardDetails = `${prefix ? prefix + '\n\n' : ''}` +
+      `👤<b>Name:</b> ${card.name}\n` +
+      `💮 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+      `🤝<b>ᴛᴇᴀᴍ:</b> ${card.country}\n\n` +
+      `${card.bio ? `ʙɪᴏ: ${card.bio}\n` : ''}` +
+      `ʀᴏʟᴇ: ${card.role}\n\n` +
+      `🆔 <b>ID:</b> ${card.id}`;
     console.log('Calling sendPhoto with:', chatId || ctx.chat.id, card.imageUrl);
     
     // Add Top Collectors button if requested
@@ -2837,7 +3251,13 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
     try {
       const response = await axios.get(card.imageUrl, { responseType: 'arraybuffer' });
       const buffer = Buffer.from(response.data, 'binary');
-      const cardDetails = `${prefix ? prefix + '\n\n' : ''}<b>Card details:</b>\n<b>Card ID:</b> ${card.id}\n<b>Name:</b> ${card.name}\n<b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n<b>Country:</b> ${card.country}\n<b>Role:</b> ${card.role}${card.bio ? `\n<b>Bio:</b> ${card.bio}` : ''}`;
+      const cardDetails = `${prefix ? prefix + '\n\n' : ''}` +
+      `👤<b>Name:</b> ${card.name}\n` +
+      `💮 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+      `🤝<b>ᴛᴇᴀᴍ:</b> ${card.country}\n\n` +
+      `${card.bio ? `ʙɪᴏ: ${card.bio}\n` : ''}` +
+      `ʀᴏʟᴇ: ${card.role}\n\n` +
+      `🆔 <b>ID:</b> ${card.id}`;
       try {
         await ctx.telegram.sendPhoto(
           chatId || ctx.chat.id,
@@ -3664,6 +4084,7 @@ bot.on('inline_query', async (ctx) => {
   }
 });
 
+
 // Handler for showing full card from search results
 bot.action(/^show_card_(\d+)$/, async (ctx) => {
   try {
@@ -3697,10 +4118,20 @@ bot.action(/^show_card_(\d+)$/, async (ctx) => {
 // Handler for collecting the card in group chat when a user types the card name
 bot.on("text", async (ctx, next) => {
   try {
+    // Check if user is banned before processing any text
+    if (ctx.from) {
+      const user = await ensureUser(prisma, ctx.from);
+      
+      // If user is banned, don't process their messages for card drops
+      if (user.isBanned) {
+        return next();
+      }
+    }
+
     // Handle bio change for admins
     if (ctx.from) {
     const admin = await ensureUser(prisma, ctx.from);
-    if (await isAdmin({ id: admin.id }) && pendingBioChanges.has(admin.id)) {
+    if (await isAdmin(admin) && pendingBioChanges.has(admin.id)) {
       const cardId = pendingBioChanges.get(admin.id)!;
       const newBio = ctx.message.text;
       
@@ -3729,7 +4160,7 @@ bot.on("text", async (ctx, next) => {
     }
     
     // Handle addcard wizard for admins
-    if (await isAdmin({ id: admin.id }) && addCardStates.has(admin.id)) {
+    if (await isAdmin(admin) && addCardStates.has(admin.id)) {
       const state = addCardStates.get(admin.id)!;
       const input = ctx.message.text;
       
@@ -4031,6 +4462,37 @@ async function sendCardCollectionMessage(ctx: any, card: any, userName: string) 
     });
   }
 }
+
+// Ban check middleware
+bot.use(async (ctx, next) => {
+  if (ctx.from) {
+    try {
+      const user = await ensureUser(prisma, ctx.from);
+      
+      // Allow /profile command for banned users
+      if (user.isBanned && ctx.message && 'text' in ctx.message) {
+        const text = ctx.message.text;
+        if (text === '/profile') {
+          return next();
+        }
+        
+        // Block all other commands and interactions for banned users
+        if (text.startsWith('/')) {
+          await ctx.reply('🚫 You are banned from using this bot. Contact an admin for assistance.', { ...getReplyParams(ctx) });
+          return;
+        }
+        
+        // Block card collection for banned users
+        if (text && !text.startsWith('/')) {
+          return; // Don't process card collection for banned users
+        }
+      }
+    } catch (error) {
+      console.error('Error in ban check middleware:', error);
+    }
+  }
+  return next();
+});
 
 // Insert Group Command Admin Middleware
 bot.use(async (ctx, next) => {
