@@ -724,7 +724,7 @@ bot.command('changerarity', async (ctx) => {
   }
 });
 
-// Command to give card to user: /daan card_id (admin only, must reply to user's message)
+// Command to give card to user: /daan card_id quantity (admin only, must reply to user's message)
 bot.command('daan', async (ctx) => {
   const admin = await ensureUser(prisma, ctx.from);
   if (!await isAdmin(admin)) {
@@ -738,7 +738,10 @@ bot.command('daan', async (ctx) => {
   
   const parts = (ctx.message.text || '').split(/\s+/);
   const cardId = Number(parts[1]);
-  if (!cardId) return ctx.reply('Usage: /daan <cardId> (reply to user\'s message)', { ...getReplyParams(ctx) });
+  const quantity = Number(parts[2]) || 1; // Default to 1 if not specified
+  
+  if (!cardId) return ctx.reply('Usage: /daan <cardId> <quantity> (reply to user\'s message)', { ...getReplyParams(ctx) });
+  if (quantity <= 0) return ctx.reply('Quantity must be greater than 0.', { ...getReplyParams(ctx) });
   
   try {
     // Check if card exists
@@ -750,7 +753,7 @@ bot.command('daan', async (ctx) => {
     // Get the target user (the one being replied to)
     const targetUser = await ensureUser(prisma, ctx.message.reply_to_message.from);
     
-    // Use transaction to give the card and update totalCardsCollected
+    // Use transaction to give the cards and update totalCardsCollected
     await prisma.$transaction(async (tx) => {
       // Check if user already has this card
       const existing = await tx.ownership.findUnique({
@@ -766,7 +769,7 @@ bot.command('daan', async (ctx) => {
         // Increment quantity if user already has the card
         await tx.ownership.update({
           where: { id: existing.id },
-          data: { quantity: existing.quantity + 1 }
+          data: { quantity: existing.quantity + quantity }
         });
       } else {
         // Create new ownership if user doesn't have the card
@@ -774,7 +777,7 @@ bot.command('daan', async (ctx) => {
           data: {
             userId: targetUser.id,
             cardId: cardId,
-            quantity: 1
+            quantity: quantity
           }
         });
       }
@@ -782,7 +785,7 @@ bot.command('daan', async (ctx) => {
       // Increment totalCardsCollected for the target user
       await tx.user.update({
         where: { id: targetUser.id },
-        data: { totalCardsCollected: { increment: 1 } }
+        data: { totalCardsCollected: { increment: quantity } }
       });
     });
     
@@ -793,14 +796,107 @@ bot.command('daan', async (ctx) => {
     
     // Also send confirmation to admin
     await ctx.reply(
-      `✅ Card given successfully!\n\n` +
+      `✅ Cards given successfully!\n\n` +
       `Given to: ${targetUserName}\n` +
       `Card: ${getRarityWithEmoji(card.rarity)} ${card.name}\n` +
+      `Quantity: ${quantity}\n` +
       `Card ID: ${cardId}`,
       { ...getReplyParams(ctx) }
     );
   } catch (e: any) {
-    await ctx.reply('Failed to give card: ' + (e.message || e), { ...getReplyParams(ctx) });
+    await ctx.reply('Failed to give cards: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
+// Command to remove cards from user: /punishment card_id quantity (admin only, must reply to user's message)
+bot.command('punishment', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin(admin)) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
+  
+  // Check if this is a reply to another user's message
+  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.from) {
+    return ctx.reply('Please reply to a user\'s message to remove cards from them.', { ...getReplyParams(ctx) });
+  }
+  
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  const quantity = Number(parts[2]) || 1; // Default to 1 if not specified
+  
+  if (!cardId) return ctx.reply('Usage: /punishment <cardId> <quantity> (reply to user\'s message)', { ...getReplyParams(ctx) });
+  if (quantity <= 0) return ctx.reply('Quantity must be greater than 0.', { ...getReplyParams(ctx) });
+  
+  try {
+    // Check if card exists
+    const card = await prisma.card.findUnique({ where: { id: cardId } });
+    if (!card) {
+      return ctx.reply('Card not found.', { ...getReplyParams(ctx) });
+    }
+    
+    // Get the target user (the one being replied to)
+    const targetUser = await ensureUser(prisma, ctx.message.reply_to_message.from);
+    
+    // Use transaction to remove the cards and update totalCardsCollected
+    await prisma.$transaction(async (tx) => {
+      // Check if user has this card
+      const existing = await tx.ownership.findUnique({
+        where: {
+          userId_cardId: {
+            userId: targetUser.id,
+            cardId: cardId
+          }
+        }
+      });
+
+      if (!existing) {
+        throw new Error('User does not have this card.');
+      }
+
+      if (existing.quantity <= quantity) {
+        // Remove the ownership completely if removing all or more cards than owned
+        const actualRemoved = existing.quantity;
+        await tx.ownership.delete({
+          where: { id: existing.id }
+        });
+        
+        // Decrement totalCardsCollected for the target user
+        await tx.user.update({
+          where: { id: targetUser.id },
+          data: { totalCardsCollected: { decrement: actualRemoved } }
+        });
+        
+        return actualRemoved;
+      } else {
+        // Decrement quantity if user has more cards than being removed
+        await tx.ownership.update({
+          where: { id: existing.id },
+          data: { quantity: existing.quantity - quantity }
+        });
+        
+        // Decrement totalCardsCollected for the target user
+        await tx.user.update({
+          where: { id: targetUser.id },
+          data: { totalCardsCollected: { decrement: quantity } }
+        });
+        
+        return quantity;
+      }
+    });
+    
+    const targetUserName = targetUser.firstName || targetUser.username || 'User';
+    
+    // Send confirmation to admin
+    await ctx.reply(
+      `✅ Cards removed successfully!\n\n` +
+      `Removed from: ${targetUserName}\n` +
+      `Card: ${getRarityWithEmoji(card.rarity)} ${card.name}\n` +
+      `Quantity removed: ${quantity}\n` +
+      `Card ID: ${cardId}`,
+      { ...getReplyParams(ctx) }
+    );
+  } catch (e: any) {
+    await ctx.reply('Failed to remove cards: ' + (e.message || e), { ...getReplyParams(ctx) });
   }
 });
 
@@ -1759,6 +1855,93 @@ bot.command('leaderboard', async (ctx) => {
   await ctx.reply(`🏆 Top 10 Card Collectors\n\n${msg}`, { ...getReplyParams(ctx) });
 });
 
+// Command to show today's leaderboard: /tleaderboard
+bot.command('tleaderboard', async (ctx) => {
+  try {
+    // Get today's date range
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    // Get all users with their today's collection count
+    const users = await prisma.user.findMany({
+      select: {
+        id: true,
+        firstName: true,
+        username: true,
+        totalCardsCollected: true,
+        ownedCards: {
+          select: {
+            quantity: true,
+            card: {
+              select: {
+                id: true
+              }
+            }
+          },
+          where: {
+            card: {
+              createdAt: {
+                gte: today,
+                lt: tomorrow
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // Calculate today's collection count for each user
+    const todayStats = users.map(user => {
+      const todayCollection = user.ownedCards.reduce((sum, ownership) => sum + ownership.quantity, 0);
+      return {
+        ...user,
+        todayCollection
+      };
+    });
+
+    // Sort by today's collection count (descending)
+    todayStats.sort((a, b) => b.todayCollection - a.todayCollection);
+
+    // Get top 10
+    const top10 = todayStats.slice(0, 10);
+
+    if (top10.length === 0) {
+      return ctx.reply('📊 No cards collected today yet. Be the first to collect!', { ...getReplyParams(ctx) });
+    }
+
+    // Build leaderboard message
+    let leaderboardMessage = `📊 <b>Today's Top Collectors</b>\n\n`;
+    
+    top10.forEach((user, index) => {
+      const rank = index + 1;
+      const name = user.firstName || user.username || 'Anonymous';
+      const count = user.todayCollection;
+      
+      // Add rank emoji
+      let rankEmoji = '';
+      if (rank === 1) rankEmoji = '🥇';
+      else if (rank === 2) rankEmoji = '🥈';
+      else if (rank === 3) rankEmoji = '🥉';
+      else rankEmoji = '🏆';
+      
+      leaderboardMessage += `${rankEmoji} <b>${rank}.</b> ${name} — <b>${count}</b> cards\n`;
+    });
+
+    leaderboardMessage += `\n📅 <b>Date:</b> ${today.toLocaleDateString()}`;
+
+    await ctx.reply(leaderboardMessage, {
+      parse_mode: 'HTML',
+      ...getReplyParams(ctx)
+    });
+
+  } catch (error) {
+    console.error('Error in tleaderboard command:', error);
+    await ctx.reply('❌ Error fetching today\'s leaderboard. Please try again.', { ...getReplyParams(ctx) });
+  }
+});
+
 bot.hears('🏆 Leaderboard', async (ctx) => {
   const top = await getLeaderboard(prisma);
   if (top.length === 0) return ctx.reply('No players yet. Be the first!', { ...getReplyParams(ctx) });
@@ -2398,9 +2581,9 @@ bot.command('allcards', async (ctx) => {
 bot.command('help', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
   const isUserAdmin = await isAdmin(user);
-  let helpText = '/start, /help, /profile, /pack, /cards, /allcards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
+  let helpText = '/start, /help, /profile, /pack, /cards, /allcards, /daily, /leaderboard, /tleaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
   if (isUserAdmin) {
-    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changeimage - Change card image\n/changebio - Change card bio\n/changecountry - Change card country\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/botban - Ban a user\n/botunban - Unban a user\n/unbantemp - Remove temporary spam ban\n/dropcard <card_id> <group_id> - Drop a specific card into group (private chat)\n/getgroupid - Get group ID (use in group)\n/limit <number> - Set spam limit (messages per 2 seconds)\n/droprate <number> - Set messages required for card drop';
+    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changeimage - Change card image\n/changebio - Change card bio\n/changecountry - Change card country\n/daan <card_id> <quantity> - Give cards to user (reply to message)\n/punishment <card_id> <quantity> - Remove cards from user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/botban - Ban a user\n/botunban - Unban a user\n/unbantemp - Remove temporary spam ban\n/dropcard <card_id> <group_id> - Drop a specific card into group (private chat)\n/getgroupid - Get group ID (use in group)\n/limit <number> - Set spam limit (messages per 2 seconds)\n/droprate <number> - Set messages required for card drop';
   }
   await ctx.reply(helpText);
 });
@@ -2686,7 +2869,9 @@ bot.command('profile', async (ctx) => {
   });
   
   profileMessage += `━━━━━━━━━━━━━━━━━━\n\n`;
-  profileMessage += `🏟️ Keep collecting to climb the leaderboard!`;
+  profileMessage += `🏟️ Keep collecting to climb the leaderboard!\n\n`;
+  profileMessage += `━━━━━━━━━━━━━━━━━━\n`;
+  profileMessage += `${user.isBanned ? '🚫 <b>Status:</b> BANNED' : '✅ <b>Status:</b> Active'}`;
   
   // Get favorite card if set
   let favoriteCard = null;
@@ -3281,7 +3466,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
     // Fallback: If no image or image sending failed, send text-only message
     const cardDetails = `${prefix ? prefix + '\n\n' : ''}` +
       `👤<b>Name:</b> ${card.name}\n` +
-      `💮 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+      `💎 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n` +
       `🤝<b>ᴛᴇᴀᴍ:</b> ${card.country}\n\n` +
       `${card.bio ? `ʙɪᴏ: ${card.bio}\n` : ''}` +
       `ʀᴏʟᴇ: ${card.role}\n\n` +
@@ -3305,7 +3490,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
   try {
     const cardDetails = `${prefix ? prefix + '\n\n' : ''}` +
       `👤<b>Name:</b> ${card.name}\n` +
-      `💮 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+      `💎 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n` +
       `🤝<b>ᴛᴇᴀᴍ:</b> ${card.country}\n\n` +
       `${card.bio ? `ʙɪᴏ: ${card.bio}\n` : ''}` +
       `ʀᴏʟᴇ: ${card.role}\n\n` +
@@ -3339,7 +3524,7 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
       const buffer = Buffer.from(response.data, 'binary');
       const cardDetails = `${prefix ? prefix + '\n\n' : ''}` +
       `👤<b>Name:</b> ${card.name}\n` +
-      `💮 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)} ${card.rarity}\n` +
+      `💎 <b>Rarity:</b> ${getRarityWithEmoji(card.rarity)}\n` +
       `🤝<b>ᴛᴇᴀᴍ:</b> ${card.country}\n\n` +
       `${card.bio ? `ʙɪᴏ: ${card.bio}\n` : ''}` +
       `ʀᴏʟᴇ: ${card.role}\n\n` +
@@ -4358,17 +4543,19 @@ bot.on("text", async (ctx, next) => {
     const chatId = ctx.chat.id;
     const activeCard = activeCardDrops.get(chatId);
     if (activeCard && !activeCard.collected) {
-      // Split the card name and user's message into words
-      const cardNameParts = activeCard.name.toLowerCase().split(/\s+/);
-      const userMessageParts = ctx.message.text.trim().toLowerCase().split(/\s+/);
+      // Check for name matching (allows first name, last name, or full name at the beginning)
+      const cardName = activeCard.name.toLowerCase().trim();
+      const userMessage = ctx.message.text.toLowerCase().trim();
       
-      // Check if any part of the user's message matches any part of the card name
-      const isMatch = userMessageParts.some(msgPart => 
-        // Check if this part matches the full card name
-        activeCard.name.toLowerCase() === msgPart ||
-        // Or if it matches any part of the card name
-        cardNameParts.some(namePart => namePart === msgPart)
-      );
+      // Split card name into parts (first name, last name, etc.)
+      const cardNameParts = cardName.split(/\s+/);
+      
+      // Check if user's message starts with any part of the card name or the full name
+      // This prevents matching names in the middle of sentences
+      const isMatch = cardNameParts.some(part => 
+        userMessage === part || // Exact match with any part
+        userMessage.startsWith(part) // User message starts with any part
+      ) || userMessage === cardName || userMessage.startsWith(cardName);
       
       if (isMatch) {
         // Add card to user's collection
@@ -4596,4 +4783,3 @@ bot.use(async (ctx, next) => {
   }
   return next();
 });
-
