@@ -6,7 +6,7 @@ import dayjs from 'dayjs';
 import { PrismaClient } from '@prisma/client';
 import { ensureUser, openPackForUser, listUserCards, claimDaily, getLeaderboard } from '../services/game.js';
 import { createTrade, acceptTrade, rejectTrade, myTrades } from '../services/trade.js';
-import { browseMarket, listForSale, buyFromMarket, cancelListing } from '../services/market.js';
+import { browseMarket, listForSale, buyFromMarket, cancelListing, findBestListing } from '../services/market.js';
 
 async function isAdmin(user: { isAdmin: boolean }): Promise<boolean> {
   return user.isAdmin || false;
@@ -1333,10 +1333,25 @@ bot.start(async (ctx) => {
   );
 });
 
-function marketKeyboard() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback('🔄 Refresh', 'market_refresh')],
-  ]);
+function marketKeyboard(page: number = 0, totalPages: number = 1) {
+  const keyboard = [];
+  
+  // Add pagination controls if there are multiple pages
+  if (totalPages > 1) {
+    const prevPage = page > 0 ? page - 1 : totalPages - 1;
+    const nextPage = page < totalPages - 1 ? page + 1 : 0;
+    
+    keyboard.push([
+      Markup.button.callback('◀️ Prev', `market_page_${prevPage}`),
+      Markup.button.callback(`${page + 1}/${totalPages}`, 'market_page_info'),
+      Markup.button.callback('Next ▶️', `market_page_${nextPage}`)
+    ]);
+  }
+  
+  // Add refresh button
+  keyboard.push([Markup.button.callback('🔄 Refresh', 'market_refresh')]);
+  
+  return Markup.inlineKeyboard(keyboard);
 }
 
 function listingActions(listingId: number) {
@@ -1950,27 +1965,60 @@ bot.hears('🏆 Leaderboard', async (ctx) => {
 });
 
 bot.command('market', async (ctx) => {
+  await showMarketPage(ctx, 0);
+});
+
+async function showMarketPage(ctx: any, page: number = 0, itemsPerPage: number = 5, isEdit: boolean = false) {
   const listings = await browseMarket(prisma);
   if (listings.length === 0) return ctx.reply('No active listings in the market.', marketKeyboard());
 
-  let msg = '🏪 *Market Listings*\n\n';
-  for (const l of listings) {
-    msg += `*${l.card.name}* [${l.card.rarity}]\n`;
-    msg += `├ ID: \`${l.cardId}\`\n`;
-    msg += `├ Price: ${l.price} 💰\n`;
-    msg += `├ Quantity: ${l.quantity}x\n`;
-    msg += `└ Seller: @${l.seller.username ?? 'anon'}\n\n`;
-  }
-  msg += '\nMarket Commands:\n';
-  msg += '`/addpmarket card_id price` - List a card for sale\n';
-  msg += '`/buypmarket card_id quantity` - Buy a card\n';
-  msg += '`/removepmarket card_id` - Remove your listing';
+  const totalPages = Math.ceil(listings.length / itemsPerPage);
+  const startIndex = page * itemsPerPage;
+  const endIndex = Math.min(startIndex + itemsPerPage, listings.length);
+  const pageListings = listings.slice(startIndex, endIndex);
 
-  await ctx.reply(msg, { 
-    parse_mode: 'Markdown',
-    ...marketKeyboard()
-  });
-});
+  let msg = `🏪 <b>Market Listings</b> (Page ${page + 1}/${totalPages})\n\n`;
+  
+  for (let i = 0; i < pageListings.length; i++) {
+    const l = pageListings[i];
+    const globalIndex = startIndex + i + 1;
+    msg += `${globalIndex}. ${getRarityWithEmoji(l.card.rarity)} <b>${l.card.name}</b>\n`;
+    msg += `   ├ 🆔 ID: <code>${l.cardId}</code>\n`;
+    msg += `   ├ 💰 Price: ${l.price} coins\n`;
+    msg += `   └ 👤 Seller: @${l.seller.username ?? 'anon'}\n\n`;
+  }
+  
+  msg += `📋 <b>Market Commands:</b>\n`;
+  msg += `<code>/addpmarket card_id price</code> - List a card for sale\n`;
+  msg += `<code>/buypmarket card_id quantity</code> - Buy a card\n`;
+  msg += `<code>/removepmarket card_id</code> - Remove your listing\n\n`;
+  msg += `💡 <b>Tip:</b> If multiple sellers have the same card ID, the system will buy the cheapest option, or the one with lower listing ID if prices are equal.`;
+
+  const keyboard = marketKeyboard(page, totalPages);
+  
+  if (isEdit && ctx.callbackQuery) {
+    try {
+      await ctx.editMessageText(msg, { 
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...keyboard
+      });
+    } catch (error) {
+      // If edit fails, send a new message
+      await ctx.reply(msg, { 
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...keyboard
+      });
+    }
+  } else {
+    await ctx.reply(msg, { 
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...keyboard
+    });
+  }
+}
 
 bot.hears('🛒 Market', async (ctx) => {
   // Redirect to /market command for consistency
@@ -1979,11 +2027,17 @@ bot.hears('🛒 Market', async (ctx) => {
 
 bot.action(/^market_refresh$/, async (ctx) => {
   await ctx.answerCbQuery();
-  const listings = await browseMarket(prisma);
-  if (listings.length === 0) return ctx.reply('No active listings.', marketKeyboard());
-  for (const l of listings) {
-    await ctx.reply(`${l.card.name} [${l.card.rarity}] — ${l.price} coins (qty ${l.quantity}) — by @${l.seller.username ?? 'anon'}`, listingActions(l.id));
-  }
+  await showMarketPage(ctx, 0);
+});
+
+bot.action(/^market_page_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const page = parseInt(ctx.match[1]);
+  await showMarketPage(ctx, page, 5, true); // Pass true to indicate this is an edit
+});
+
+bot.action(/^market_page_info$/, async (ctx) => {
+  await ctx.answerCbQuery('💡 Use Prev/Next buttons to navigate market pages');
 });
 
 
@@ -2243,7 +2297,7 @@ bot.action(/^addcard_rarity_(.+)$/, async (ctx) => {
     state.step = 'country';
     
     await ctx.editMessageText(
-      `✅ Rarity selected: ${getRarityWithEmoji(rarity)} ${rarity}\n\n` +
+      `✅ Rarity selected: ${getRarityWithEmoji(rarity)}\n\n` +
       `Step 3/6: Enter the country/team:\n\n` +
       `Example: India, Australia, England`
     );
@@ -3087,14 +3141,28 @@ bot.command('buypmarket', async (ctx) => {
   const cardId = Number(parts[1]);
   if (!cardId) return ctx.reply('Usage: /buypmarket <cardId>');
   try {
-    // Find active listing for this card
-    const listings = await browseMarket(prisma);
-    const listing = listings.find(l => l.cardId === cardId && l.active && l.quantity > 0);
+    // Find the best listing (cheapest price, then lowest listing ID)
+    const listing = await findBestListing(prisma, cardId);
     if (!listing) return ctx.reply('No active listing for this card.');
+    
+    // Check if there are multiple listings for the same card
+    const listings = await browseMarket(prisma);
+    const duplicateListings = listings.filter(l => l.cardId === cardId && l.active && l.quantity > 0);
+    if (duplicateListings.length > 1) {
+      const prices = duplicateListings.map(l => l.price).sort((a, b) => a - b);
+      await ctx.reply(
+        `⚠️ Multiple listings found for card ${cardId}!\n` +
+        `💰 Price range: ${prices[0]} - ${prices[prices.length - 1]} coins\n` +
+        `🛒 Buying from the CHEAPEST listing (${listing.price} coins)\n` +
+        `👤 Seller: @${listing.seller.username ?? 'anon'}\n\n` +
+        `💡 Tip: System automatically selects the cheapest option!`
+      );
+    }
+    
     const res = await buyFromMarket(prisma, user.id, listing.id, 1);
-    await ctx.reply(`Purchased 1 of card ${cardId} for ${listing.price} coins. Seller @${listing.seller.username ?? 'anon'} received ${listing.price} coins.`);
+    await ctx.reply(`✅ Purchased 1 of card ${cardId} for ${listing.price} coins. Seller @${listing.seller.username ?? 'anon'} received ${listing.price} coins.`);
   } catch (e: any) {
-    await ctx.reply(`Buy from market failed: ${e.message}`);
+    await ctx.reply(`❌ Buy from market failed: ${e.message}`);
   }
 });
 
