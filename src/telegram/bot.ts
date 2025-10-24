@@ -1090,6 +1090,96 @@ bot.command('unbantemp', async (ctx) => {
   });
 });
 
+// Command to drop a specific card into a group: /dropcard card_id group_id
+bot.command('dropcard', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!admin.isAdmin) {
+    return ctx.reply('❌ You must be an admin to use this command.', { ...getReplyParams(ctx) });
+  }
+
+  // Only work in private chats (admin's bot chat)
+  if (!ctx.chat || ctx.chat.type !== 'private') {
+    return ctx.reply('❌ This command only works in private chat with the bot.', { ...getReplyParams(ctx) });
+  }
+
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  const groupId = parts[2];
+  
+  if (!cardId || !groupId) {
+    return ctx.reply('❌ Usage: /dropcard <card_id> <group_id>\nExample: /dropcard 25 -1001234567890\n\nTo get group ID, add bot to group and use /getgroupid', { ...getReplyParams(ctx) });
+  }
+
+  try {
+    // Get the card details
+    const card = await prisma.card.findUnique({
+      where: { id: cardId }
+    });
+
+    if (!card) {
+      return ctx.reply(`❌ Card with ID ${cardId} not found.`, { ...getReplyParams(ctx) });
+    }
+
+    // Replace any existing card drop in the target group
+    activeCardDrops.set(Number(groupId), {
+      id: card.id,
+      name: card.name,
+      rarity: card.rarity,
+      country: card.country,
+      role: card.role,
+      bio: card.bio,
+      imageUrl: card.imageUrl,
+      collected: false
+    });
+
+    // Send the card drop message to the target group (same format as regular card drops)
+    const botUsername = 'Cricketdynamic_bot'; // Use the actual bot username
+    const startParam = encodeURIComponent(`card${card.id}`);
+    const url = `https://t.me/${botUsername}?start=${startParam}`;
+    const caption = `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`;
+    const reply_markup = {
+      inline_keyboard: [
+        [{ text: '📩 ᴄʜᴇᴄᴋ ɴᴀᴍᴇ ɪɴ ᴅᴍ', url }]
+      ]
+    };
+
+    // Send with image if available, otherwise just text (same format as regular drops)
+    if (card.imageUrl && card.imageUrl.startsWith('http')) {
+      try {
+        await ctx.telegram.sendPhoto(Number(groupId), card.imageUrl, {
+          caption: caption,
+          reply_markup: reply_markup
+        });
+      } catch (error) {
+        // If photo fails, send as text message
+        await ctx.telegram.sendMessage(Number(groupId), caption, {
+          reply_markup: reply_markup
+        });
+      }
+    } else {
+      await ctx.telegram.sendMessage(Number(groupId), caption, {
+        reply_markup: reply_markup
+      });
+    }
+
+    // Confirm to admin
+    await ctx.reply(`✅ Card dropped successfully!\n\nCard: ${card.name} (ID: ${card.id})\nGroup: ${groupId}`, { ...getReplyParams(ctx) });
+
+  } catch (error) {
+    console.error('Error in dropcard command:', error);
+    await ctx.reply('❌ Error dropping card. Please check the group ID and try again.', { ...getReplyParams(ctx) });
+  }
+});
+
+// Command to get group ID: /getgroupid
+bot.command('getgroupid', async (ctx) => {
+  if (ctx.chat && ctx.chat.type !== 'private') {
+    await ctx.reply(`Group ID: ${ctx.chat.id}\n\nUse this ID with /dropcard command in your private chat with the bot.`, { ...getReplyParams(ctx) });
+  } else {
+    await ctx.reply('❌ This command only works in group chats to get the group ID.', { ...getReplyParams(ctx) });
+  }
+});
+
 // Remove all active listings for a card by the user: /removepmarket card_id
 bot.command('removepmarket', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
@@ -2310,7 +2400,7 @@ bot.command('help', async (ctx) => {
   const isUserAdmin = await isAdmin(user);
   let helpText = '/start, /help, /profile, /pack, /cards, /allcards, /daily, /leaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
   if (isUserAdmin) {
-    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changeimage - Change card image\n/changebio - Change card bio\n/changecountry - Change card country\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/botban - Ban a user\n/botunban - Unban a user\n/unbantemp - Remove temporary spam ban\n/limit <number> - Set spam limit (messages per 2 seconds)\n/droprate <number> - Set messages required for card drop';
+    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changeimage - Change card image\n/changebio - Change card bio\n/changecountry - Change card country\n/daan - Give card to user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/botban - Ban a user\n/botunban - Unban a user\n/unbantemp - Remove temporary spam ban\n/dropcard <card_id> <group_id> - Drop a specific card into group (private chat)\n/getgroupid - Get group ID (use in group)\n/limit <number> - Set spam limit (messages per 2 seconds)\n/droprate <number> - Set messages required for card drop';
   }
   await ctx.reply(helpText);
 });
@@ -2966,15 +3056,11 @@ async function getTodayCollectionCount(prisma: PrismaClient, userId: number): Pr
 // Utility function to get a random card with weighted probabilities
 async function getRandomCard(prisma: PrismaClient) {
   const rarityWeights = {
-    'COMMON': 35,
+    'COMMON': 25,
     'MEDIUM': 25,
-    'RARE': 15,
-    'LEGENDARY': 10,
-    'EXCLUSIVE': 6,
-    'LIMITED_EDITION': 4,
-    'COSMIC': 2.5,
-    'PRIME': 1.5,
-    'PREMIUM': 1
+    'RARE': 25,
+    'LEGENDARY': 20,
+    'EXCLUSIVE': 5
   };
 
   // Calculate total weight
