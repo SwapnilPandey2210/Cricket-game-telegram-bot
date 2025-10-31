@@ -900,6 +900,217 @@ bot.command('punishment', async (ctx) => {
   }
 });
 
+// Command to give coins to all users: /giveall amount (admin only)
+bot.command('giveall', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin(admin)) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
+  
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const amount = Number(parts[1]);
+  
+  if (!amount || amount <= 0) {
+    return ctx.reply('Usage: /giveall <amount>\nAmount must be greater than 0.', { ...getReplyParams(ctx) });
+  }
+  
+  try {
+    // Get all users
+    const allUsers = await prisma.user.findMany();
+    const userCount = allUsers.length;
+    
+    // Update all users' coins
+    await prisma.user.updateMany({
+      data: { coins: { increment: amount } }
+    });
+    
+    await ctx.reply(
+      `✅ Coins distributed successfully!\n\n` +
+      `Amount: ${amount} coins\n` +
+      `Users: ${userCount}\n` +
+      `Total: ${amount * userCount} coins distributed`,
+      { ...getReplyParams(ctx) }
+    );
+  } catch (e: any) {
+    await ctx.reply('Failed to distribute coins: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
+// Command to rob coins from a user: /rob amount (admin only, must reply to user's message)
+bot.command('rob', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin(admin)) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
+  
+  // Check if this is a reply to another user's message
+  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.from) {
+    return ctx.reply('Please reply to a user\'s message to rob coins from them.', { ...getReplyParams(ctx) });
+  }
+  
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const amount = Number(parts[1]);
+  
+  if (!amount || amount <= 0) {
+    return ctx.reply('Usage: /rob <amount> (reply to user\'s message)\nAmount must be greater than 0.', { ...getReplyParams(ctx) });
+  }
+  
+  try {
+    // Get the target user
+    const targetUser = await ensureUser(prisma, ctx.message.reply_to_message.from);
+    
+    // Calculate new coin amount (can't go below 0)
+    const newCoins = Math.max(0, targetUser.coins - amount);
+    const actualRobbed = targetUser.coins - newCoins;
+    
+    // Update user's coins
+    await prisma.user.update({
+      where: { id: targetUser.id },
+      data: { coins: newCoins }
+    });
+    
+    const targetUserName = targetUser.firstName || targetUser.username || 'User';
+    
+    if (actualRobbed > 0) {
+      await ctx.reply(
+        `💰 Coins robbed successfully!\n\n` +
+        `User: ${targetUserName}\n` +
+        `Amount robbed: ${actualRobbed} coins\n` +
+        `Remaining: ${newCoins} coins`,
+        { ...getReplyParams(ctx) }
+      );
+    } else {
+      await ctx.reply(
+        `💰 Robbery attempt failed!\n\n` +
+        `User: ${targetUserName}\n` +
+        `They had no coins to rob!`,
+        { ...getReplyParams(ctx) }
+      );
+    }
+  } catch (e: any) {
+    await ctx.reply('Failed to rob coins: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
+// Command to make a user a begger (reset completely): /makebegger (admin only, must reply to user's message)
+bot.command('makebegger', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!await isAdmin(admin)) {
+    return ctx.reply('Only admins can use this command.', { ...getReplyParams(ctx) });
+  }
+  
+  // Check if this is a reply to another user's message
+  if (!ctx.message.reply_to_message || !ctx.message.reply_to_message.from) {
+    return ctx.reply('Please reply to a user\'s message to make them a begger.', { ...getReplyParams(ctx) });
+  }
+  
+  try {
+    // Get the target user
+    const targetUser = await ensureUser(prisma, ctx.message.reply_to_message.from);
+    
+    // Don't allow making an admin a begger
+    if (targetUser.isAdmin) {
+      return ctx.reply('Cannot make an admin a begger!', { ...getReplyParams(ctx) });
+    }
+    
+    // Delete all card ownerships
+    await prisma.ownership.deleteMany({
+      where: { userId: targetUser.id }
+    });
+    
+    // Reset user to begger status
+    await prisma.user.update({
+      where: { id: targetUser.id },
+      data: {
+        coins: 0,
+        totalCardsCollected: 0
+      }
+    });
+    
+    const targetUserName = targetUser.firstName || targetUser.username || 'User';
+    
+    await ctx.reply(
+      `🪦 User reset to begger status!\n\n` +
+      `User: ${targetUserName}\n` +
+      `Coins: 0\n` +
+      `Cards: All deleted\n` +
+      `Total collected: 0`,
+      { ...getReplyParams(ctx) }
+    );
+  } catch (e: any) {
+    await ctx.reply('Failed to make begger: ' + (e.message || e), { ...getReplyParams(ctx) });
+  }
+});
+
+// Command to drop a fake card: /dropfcard card_id group_id (admin only, private chat only)
+bot.command('dropfcard', async (ctx) => {
+  const admin = await ensureUser(prisma, ctx.from);
+  if (!admin.isAdmin) {
+    return ctx.reply('❌ You must be an admin to use this command.', { ...getReplyParams(ctx) });
+  }
+
+  // Only work in private chats (admin's bot chat)
+  if (!ctx.chat || ctx.chat.type !== 'private') {
+    return ctx.reply('❌ This command only works in private chat with the bot.', { ...getReplyParams(ctx) });
+  }
+
+  const parts = (ctx.message.text || '').split(/\s+/);
+  const cardId = Number(parts[1]);
+  const groupId = parts[2];
+  
+  if (!cardId || !groupId) {
+    return ctx.reply('❌ Usage: /dropfcard <card_id> <group_id>\nExample: /dropfcard 25 -1001234567890\n\nTo get group ID, add bot to group and use /getgroupid', { ...getReplyParams(ctx) });
+  }
+
+  try {
+    // Get the card details
+    const card = await prisma.card.findUnique({
+      where: { id: cardId }
+    });
+
+    if (!card) {
+      return ctx.reply(`❌ Card with ID ${cardId} not found.`, { ...getReplyParams(ctx) });
+    }
+
+    // Send the fake card drop message to the target group (same format as regular card drops)
+    const botUsername = 'Cricketdynamic_bot';
+    const startParam = encodeURIComponent(`fake${card.id}`);
+    const url = `https://t.me/${botUsername}?start=${startParam}`;
+    const caption = `🌟ᴀ ɴᴇᴡ ᴏʀ ᴊᴜꜱᴛ ᴜɴʟᴏᴄᴋᴇᴅ! ᴄᴏʟʟᴇᴄᴛ ʜɪᴍ/ʜᴇʀ 🌟\n\nᴀᴄQᴜɪʀᴇ by typing the player name.`;
+    const reply_markup = {
+      inline_keyboard: [
+        [{ text: '📩 ᴄʜᴇᴄᴋ ɴᴀᴍᴇ ɪɴ ᴅᴍ', url }]
+      ]
+    };
+
+    // Send with image if available, otherwise just text (same format as regular drops)
+    if (card.imageUrl && card.imageUrl.startsWith('http')) {
+      try {
+        await ctx.telegram.sendPhoto(Number(groupId), card.imageUrl, {
+          caption: caption,
+          reply_markup: reply_markup
+        });
+      } catch (error) {
+        // If photo fails, send as text message
+        await ctx.telegram.sendMessage(Number(groupId), caption, {
+          reply_markup: reply_markup
+        });
+      }
+    } else {
+      await ctx.telegram.sendMessage(Number(groupId), caption, {
+        reply_markup: reply_markup
+      });
+    }
+
+    // Confirm to admin
+    await ctx.reply(`✅ Fake card dropped successfully!\n\nCard: ${card.name} (ID: ${card.id})\nGroup: ${groupId}\nNote: This card cannot be collected.`, { ...getReplyParams(ctx) });
+
+  } catch (error) {
+    console.error('Error in dropfcard command:', error);
+    await ctx.reply('Failed to drop fake card: ' + (error instanceof Error ? error.message : String(error)), { ...getReplyParams(ctx) });
+  }
+});
+
 // Command to ban a user: /botban username or reply to user with /botban
 bot.command('botban', async (ctx) => {
   console.log('🔨 /botban command triggered by user:', ctx.from?.id, ctx.from?.username);
@@ -1318,6 +1529,11 @@ bot.start(async (ctx) => {
         return;
       }
     }
+  }
+  // Check for fake card parameter
+  if (startParam && /^fake\d+$/.test(startParam)) {
+    await ctx.reply('❌ No card found in the bot.', { ...getReplyParams(ctx) });
+    return;
   }
   await ctx.reply(
     `Welcome, ${name}!\nCollect, trade, and showcase cricket cards.`,
@@ -2668,7 +2884,7 @@ bot.command('help', async (ctx) => {
   const isUserAdmin = await isAdmin(user);
   let helpText = '/start, /help, /profile, /pack, /cards, /allcards, /daily, /leaderboard, /tleaderboard, /list, /cancel, /trade, /gift, /trades, /fuse, /fuselock, /fuseunlock, /fusecheck, /fav';
   if (isUserAdmin) {
-    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changeimage - Change card image\n/changebio - Change card bio\n/changecountry - Change card country\n/daan <card_id> <quantity> - Give cards to user (reply to message)\n/punishment <card_id> <quantity> - Remove cards from user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/botban - Ban a user\n/botunban - Unban a user\n/unbantemp - Remove temporary spam ban\n/dropcard <card_id> <group_id> - Drop a specific card into group (private chat)\n/getgroupid - Get group ID (use in group)\n/limit <number> - Set spam limit (messages per 2 seconds)\n/droprate <number> - Set messages required for card drop';
+    helpText += '\n\nAdmin commands:\n/addcard - Add a new card\n/deletecard - Delete a card\n/reordercards - Reorder card IDs to fill gaps\n/changerarity - Change card rarity\n/changeimage - Change card image\n/changebio - Change card bio\n/changecountry - Change card country\n/daan <card_id> <quantity> - Give cards to user (reply to message)\n/punishment <card_id> <quantity> - Remove cards from user (reply to message)\n/makeadmin - Make another user an admin\n/removeadmin - Remove admin rights from a user\n/botban - Ban a user\n/botunban - Unban a user\n/unbantemp - Remove temporary spam ban\n/dropcard <card_id> <group_id> - Drop a specific card into group (private chat)\n/dropfcard <card_id> <group_id> - Drop a fake card into group (private chat)\n/getgroupid - Get group ID (use in group)\n/limit <number> - Set spam limit (messages per 2 seconds)\n/droprate <number> - Set messages required for card drop\n/giveall <amount> - Give coins to all users\n/rob <amount> - Deduct coins from user (reply to message)\n/makebegger - Reset user completely (reply to message)';
   }
   await ctx.reply(helpText);
 });
