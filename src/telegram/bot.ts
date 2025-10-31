@@ -1691,59 +1691,14 @@ bot.action(/^cards:prev:(\d+)$/, async (ctx) => {
 // Handle allcards pagination
 bot.action(/^allcards:(\d+)$/, async (ctx) => {
   const page = Number(ctx.match[1]);
-  const CARDS_PER_PAGE = 15;
-  const skip = (page - 1) * CARDS_PER_PAGE;
-  
-  try {
-    // Get total count of cards
-    const totalCards = await prisma.card.count();
-    const totalPages = Math.ceil(totalCards / CARDS_PER_PAGE);
-    
-    if (page > totalPages || page < 1) {
-      await ctx.answerCbQuery('Invalid page number.');
-      return;
-    }
-    
-    // Get cards for current page
-    const cards = await prisma.card.findMany({
-      orderBy: { id: 'asc' },
-      skip: skip,
-      take: CARDS_PER_PAGE
-    });
-    
-    // Build message
-    let message = `🃏 All Cards (Page ${page}/${totalPages})\n\n`;
-    message += `📊 Total Cards: ${totalCards}\n`;
-    message += `━━━━━━━━━━━━━━━━━━\n\n`;
-    
-    cards.forEach((card, index) => {
-      const globalIndex = skip + index + 1;
-      message += `${card.name}`;
-      message += `   ID: ${card.id} | ${getRarityWithEmoji(card.rarity)}\n`;
-    });
-    
-    // Add pagination buttons
-    const buttons = [];
-    if (page > 1) {
-      buttons.push({ text: '⬅️ Previous', callback_data: `allcards:${page - 1}` });
-    }
-    if (page < totalPages) {
-      buttons.push({ text: 'Next ➡️', callback_data: `allcards:${page + 1}` });
-    }
-    
-    await ctx.editMessageText(message, {
-      parse_mode: 'HTML',
-      reply_markup: buttons.length ? {
-        inline_keyboard: [buttons]
-      } : undefined
-    });
-    
-    await ctx.answerCbQuery();
-    
-  } catch (error) {
-    console.error('Error in allcards pagination:', error);
-    await ctx.answerCbQuery('Error loading page.');
-  }
+  await showAllCards(ctx, page, null, true);
+});
+
+// Handle allcards rarity filter
+bot.action(/^allcards_rarity:([^:]+):(\d+)$/, async (ctx) => {
+  const rarity = ctx.match[1] === 'all' ? null : ctx.match[1];
+  const page = Number(ctx.match[2]);
+  await showAllCards(ctx, page, rarity, true);
 });
 
 // Handle /cards command with different modes
@@ -2005,7 +1960,7 @@ async function showMarketPage(ctx: any, page: number = 0, itemsPerPage: number =
       });
     } catch (error) {
       // If edit fails, send a new message
-      await ctx.reply(msg, { 
+  await ctx.reply(msg, { 
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         ...keyboard
@@ -2561,6 +2516,138 @@ bot.command('gift', async (ctx) => {
   }
 });
 
+// Helper function to show all cards with pagination and rarity filters
+async function showAllCards(ctx: any, page: number = 1, rarity: string | null = null, isEdit: boolean = false) {
+  const CARDS_PER_PAGE = 15;
+  const skip = (page - 1) * CARDS_PER_PAGE;
+  
+  try {
+    // Build query with optional rarity filter
+    const whereClause = rarity ? { rarity } : {};
+    
+    // Get total count of cards
+    const totalCards = await prisma.card.count({ where: whereClause });
+    const totalPages = Math.ceil(totalCards / CARDS_PER_PAGE);
+    
+    if (page > totalPages && totalPages > 0) {
+      if (!isEdit) {
+        await ctx.reply(`Page ${page} does not exist. There are only ${totalPages} page(s).`, { ...getReplyParams(ctx) });
+      } else {
+        await ctx.answerCbQuery('Invalid page number.');
+      }
+      return;
+    }
+    
+    if (totalCards === 0) {
+      const message = rarity 
+        ? `No ${rarity} cards found in the database.` 
+        : 'No cards found in the database.';
+      if (!isEdit) {
+        await ctx.reply(message, { ...getReplyParams(ctx) });
+      } else {
+        await ctx.answerCbQuery(message);
+      }
+      return;
+    }
+    
+    // Get cards for current page
+    const cards = await prisma.card.findMany({
+      where: whereClause,
+      orderBy: { id: 'asc' },
+      skip: skip,
+      take: CARDS_PER_PAGE
+    });
+    
+    // Build message
+    const rarityText = rarity ? ` (${rarity})` : '';
+    let message = `<b>🃏 All Cards${rarityText} - Page ${page}/${totalPages}</b>\n\n`;
+    message += `📊 Total Cards: ${totalCards}\n`;
+    message += `━━━━━━━━━━━━━━━━━━\n\n`;
+    
+    cards.forEach((card, index) => {
+      const globalIndex = skip + index + 1;
+      message += `${card.name}`;
+      message += `   ID: ${card.id} | ${getRarityWithEmoji(card.rarity)}\n`;
+    });
+    
+    // Build keyboard with pagination and rarity filters
+    const keyboard = [];
+    
+    // Pagination buttons
+    const paginationRow = [];
+    if (page > 1) {
+      paginationRow.push({ text: '⬅️ Prev', callback_data: rarity 
+        ? `allcards_rarity:${rarity}:${page - 1}` 
+        : `allcards:${page - 1}` });
+    }
+    if (page < totalPages) {
+      paginationRow.push({ text: 'Next ➡️', callback_data: rarity 
+        ? `allcards_rarity:${rarity}:${page + 1}` 
+        : `allcards:${page + 1}` });
+    }
+    if (paginationRow.length > 0) {
+      keyboard.push(paginationRow);
+    }
+    
+    // Rarity filter buttons: single wide 'All' row, then pairs per row
+    keyboard.push([
+      { text: '📋 All', callback_data: `allcards_rarity:all:1` }
+    ]);
+
+    keyboard.push([
+      { text: '🥉 Common', callback_data: 'allcards_rarity:COMMON:1' },
+      { text: '🥈 Medium', callback_data: 'allcards_rarity:MEDIUM:1' }
+    ]);
+
+    keyboard.push([
+      { text: '🥇 Rare', callback_data: 'allcards_rarity:RARE:1' },
+      { text: '🟡 Legendary', callback_data: 'allcards_rarity:LEGENDARY:1' }
+    ]);
+
+    keyboard.push([
+      { text: '💮 Exclusive', callback_data: 'allcards_rarity:EXCLUSIVE:1' },
+      { text: '🔮 Limited Edition', callback_data: 'allcards_rarity:LIMITED_EDITION:1' }
+    ]);
+
+    keyboard.push([
+      { text: '💠 Cosmic', callback_data: 'allcards_rarity:COSMIC:1' },
+      { text: '♠️ Prime', callback_data: 'allcards_rarity:PRIME:1' }
+    ]);
+
+    keyboard.push([
+      { text: '🧿 Premium', callback_data: 'allcards_rarity:PREMIUM:1' }
+    ]);
+
+    const replyOptions = {
+      parse_mode: 'HTML' as const,
+      reply_markup: {
+        inline_keyboard: keyboard
+      }
+    };
+    
+    if (isEdit && ctx.callbackQuery) {
+      try {
+        await ctx.editMessageText(message, replyOptions);
+        await ctx.answerCbQuery();
+      } catch (error) {
+        console.error('Error editing allcards message:', error);
+        await ctx.answerCbQuery('Error loading page.');
+      }
+    } else {
+      await ctx.reply(message, { ...getReplyParams(ctx), ...replyOptions });
+    }
+    
+  } catch (error) {
+    console.error('Error in showAllCards:', error);
+    const errorMsg = 'Error fetching cards. Please try again.';
+    if (!isEdit) {
+      await ctx.reply(errorMsg, { ...getReplyParams(ctx) });
+    } else {
+      await ctx.answerCbQuery('❌ Error loading cards.');
+    }
+  }
+}
+
 // Command to show all cards with pagination
 bot.command('allcards', async (ctx) => {
   const user = await ensureUser(prisma, ctx.from);
@@ -2572,63 +2659,7 @@ bot.command('allcards', async (ctx) => {
     return;
   }
   
-  const CARDS_PER_PAGE = 15;
-  const skip = (page - 1) * CARDS_PER_PAGE;
-  
-  try {
-    // Get total count of cards
-    const totalCards = await prisma.card.count();
-    const totalPages = Math.ceil(totalCards / CARDS_PER_PAGE);
-    
-    if (page > totalPages && totalPages > 0) {
-      await ctx.reply(`Page ${page} does not exist. There are only ${totalPages} page(s).`, { ...getReplyParams(ctx) });
-      return;
-    }
-    
-    if (totalCards === 0) {
-      await ctx.reply('No cards found in the database.', { ...getReplyParams(ctx) });
-      return;
-    }
-    
-    // Get cards for current page
-    const cards = await prisma.card.findMany({
-      orderBy: { id: 'asc' },
-      skip: skip,
-      take: CARDS_PER_PAGE
-    });
-    
-    // Build message
-    let message = `🃏 **All Cards (Page ${page}/${totalPages})**\n\n`;
-    message += `📊 Total Cards: ${totalCards}\n`;
-    message += `━━━━━━━━━━━━━━━━━━\n\n`;
-    
-    cards.forEach((card, index) => {
-      const globalIndex = skip + index + 1;
-      message += `${card.name}`;
-      message += `   ID: ${card.id} | ${getRarityWithEmoji(card.rarity)}\n`;
-    });
-    
-    // Add pagination buttons
-    const buttons = [];
-    if (page > 1) {
-      buttons.push({ text: '⬅️ Previous', callback_data: `allcards:${page - 1}` });
-    }
-    if (page < totalPages) {
-      buttons.push({ text: 'Next ➡️', callback_data: `allcards:${page + 1}` });
-    }
-    
-    await ctx.reply(message, {
-      ...getReplyParams(ctx),
-      parse_mode: 'HTML',
-      reply_markup: buttons.length ? {
-        inline_keyboard: [buttons]
-      } : undefined
-    });
-    
-  } catch (error) {
-    console.error('Error in /allcards command:', error);
-    await ctx.reply('Error fetching cards. Please try again.', { ...getReplyParams(ctx) });
-  }
+  await showAllCards(ctx, page, null, false);
 });
 
 
@@ -3529,8 +3560,8 @@ async function sendCardDetails(ctx: any, card: any, chatId?: number, prefix?: st
     showTopCollectors
   });
 
-  if (typeof card.imageUrl !== 'string' || !card.imageUrl.startsWith('http')) {
-    console.error('Invalid imageUrl:', card.imageUrl);
+  if (!card.imageUrl || typeof card.imageUrl !== 'string' || !card.imageUrl.startsWith('http')) {
+    console.log('No valid imageUrl, sending text-only message:', card.imageUrl);
     // Fallback: If no image or image sending failed, send text-only message
     const cardDetails = `${prefix ? prefix + '\n\n' : ''}` +
       `👤<b>Name:</b> ${card.name}\n` +
@@ -4320,7 +4351,7 @@ bot.on('inline_query', async (ctx) => {
         type: 'article' as const,
         id: `card_${card.id}`,
         title: card.name,
-        description: `${getRarityWithEmoji(card.rarity)} ${card.rarity} • ${card.country} • ${card.role}`,
+        description: `${getRarityWithEmoji(card.rarity)} • ${card.country} • ${card.role}`,
         thumb_url: card.imageUrl || undefined,
         input_message_content: {
           message_text: `🔍 **Search Result**\n\n` +
